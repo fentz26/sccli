@@ -221,8 +221,7 @@ impl Drop for Permit<'_> {
     }
 }
 
-/// Lets a queued or retrying request notice that the song it was for is no longer wanted.
-/// Requests in flight finish; their results are still valid and simply cached.
+/// Ties queued, retrying and active requests to the song they were requested for.
 #[derive(Clone)]
 pub struct Cancel(Option<(Arc<AtomicU64>, u64)>);
 
@@ -233,6 +232,10 @@ impl Cancel {
 
     pub fn tied_to(epoch: &Arc<AtomicU64>) -> Self {
         Cancel(Some((epoch.clone(), epoch.load(Ordering::Relaxed))))
+    }
+
+    pub fn can_cancel(&self) -> bool {
+        self.0.is_some()
     }
 
     pub fn is_stale(&self) -> bool {
