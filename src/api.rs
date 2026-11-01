@@ -13,7 +13,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, TryLockError,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -73,7 +73,7 @@ pub enum Failure {
 
 /// The HTTP layer, separate so every failure can be replayed in tests.
 pub trait Transport: Send + Sync {
-    fn get(&self, url: &str, oauth: Option<&str>) -> Result<Reply, Failure>;
+    fn get(&self, url: &str, oauth: Option<&str>, timeout: Duration) -> Result<Reply, Failure>;
     /// Where a link ends up after redirects.
     fn final_url(&self, url: &str) -> Option<String>;
 }
@@ -88,8 +88,14 @@ fn failure(e: ureq::Error) -> Failure {
 }
 
 impl Transport for Ureq {
-    fn get(&self, url: &str, oauth: Option<&str>) -> Result<Reply, Failure> {
-        let mut req = self.0.get(url).header("User-Agent", UA);
+    fn get(&self, url: &str, oauth: Option<&str>, timeout: Duration) -> Result<Reply, Failure> {
+        let mut req = self
+            .0
+            .get(url)
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
+            .header("User-Agent", UA);
         if let Some(t) = oauth {
             req = req.header("Authorization", format!("OAuth {t}"));
         }
@@ -244,28 +250,51 @@ impl Api {
         }
     }
 
-    fn plain(&self, url: &str) -> Result<Reply, Failure> {
-        let _permit = self.gate.enter();
-        self.http.get(url, None)
+    fn plain(&self, url: &str) -> Result<Reply, ApiError> {
+        self.plain_until(url, Instant::now() + net::REQUEST_DEADLINE, &Cancel::never())
+    }
+
+    fn plain_until(&self, url: &str, deadline: Instant, cancel: &Cancel) -> Result<Reply, ApiError> {
+        let _permit = self.gate.enter(deadline, cancel)?;
+        let timeout = net::remaining(deadline, cancel)?.min(net::ATTEMPT_TIMEOUT);
+        self.http.get(url, None, timeout).map_err(|e| match e {
+            Failure::Timeout => ApiError::Timeout,
+            Failure::Network => ApiError::Network,
+        })
+    }
+
+    fn lock_client(&self, deadline: Instant, cancel: &Cancel) -> Result<MutexGuard<'_, ClientId>, ApiError> {
+        loop {
+            let left = net::remaining(deadline, cancel)?;
+            match self.client.try_lock() {
+                Ok(c) => return Ok(c),
+                Err(TryLockError::WouldBlock) => thread::sleep(left.min(Duration::from_millis(10))),
+                Err(TryLockError::Poisoned(e)) => panic!("client id mutex poisoned: {e}"),
+            }
+        }
     }
 
     /// SoundCloud's web client id is embedded in its JS bundles.
-    fn scrape_client_id(&self) -> Result<String, ApiError> {
-        let stop = Instant::now() + SCRAPE_DEADLINE;
-        let home = match self.plain("https://soundcloud.com") {
+    fn scrape_client_id(&self, deadline: Instant, cancel: &Cancel) -> Result<String, ApiError> {
+        let stop = deadline.min(Instant::now() + SCRAPE_DEADLINE);
+        let home = match self.plain_until("https://soundcloud.com", stop, cancel) {
             Ok(r) if r.status == 200 => r.body,
             Ok(_) => return Err(ApiError::ClientId),
-            Err(Failure::Timeout) => return Err(ApiError::Timeout),
-            Err(Failure::Network) => return Err(ApiError::Network),
+            Err(e) => return Err(e),
         };
         let scripts = home
             .split('"')
             .filter(|s| s.starts_with("https://a-v2.sndcdn.com/assets/") && s.ends_with(".js"));
         for s in scripts.collect::<Vec<_>>().into_iter().rev() {
-            if Instant::now() >= stop {
-                break;
-            }
-            let Ok(js) = self.plain(s) else { continue };
+            net::remaining(stop, cancel)?;
+            let js = match self.plain_until(s, stop, cancel) {
+                Ok(js) => js,
+                Err(ApiError::Cancelled) => return Err(ApiError::Cancelled),
+                Err(_) => {
+                    net::remaining(stop, cancel)?;
+                    continue;
+                }
+            };
             if let Some(i) = js.body.find("client_id:\"") {
                 let id: String = js.body[i + 11..].chars().take_while(|c| c.is_alphanumeric()).collect();
                 if id.len() == 32 {
@@ -280,10 +309,10 @@ impl Api {
     }
 
     /// (id, generation, proven). Callers arriving during a scrape wait for its result.
-    fn client_id(&self) -> Result<(String, u64, bool), ApiError> {
-        let mut c = self.client.lock().unwrap();
+    fn client_id(&self, deadline: Instant, cancel: &Cancel) -> Result<(String, u64, bool), ApiError> {
+        let mut c = self.lock_client(deadline, cancel)?;
         if c.id.is_none() {
-            c.id = Some(self.scrape_client_id()?);
+            c.id = Some(self.scrape_client_id(deadline, cancel)?);
             c.generation += 1;
             c.refreshed = Some(Instant::now());
         }
@@ -292,25 +321,30 @@ impl Api {
 
     /// Replaces a rejected id. Whoever arrives first scrapes; the rest find the new generation
     /// and just retry. Returns false when no new id can be had right now.
-    fn refresh_client_id(&self, rejected: u64) -> bool {
-        let mut c = self.client.lock().unwrap();
+    fn refresh_client_id(&self, rejected: u64, deadline: Instant, cancel: &Cancel) -> Result<bool, ApiError> {
+        let mut c = self.lock_client(deadline, cancel)?;
         if c.generation != rejected {
-            return true;
+            return Ok(true);
         }
         if c.refreshed.is_some_and(|t| t.elapsed() < net::CLIENT_ID_REFRESH_EVERY) {
-            return false;
+            return Ok(false);
         }
         c.refreshed = Some(Instant::now());
-        let Ok(id) = self.scrape_client_id() else { return false };
+        let id = match self.scrape_client_id(deadline, cancel) {
+            Ok(id) => id,
+            Err(e @ (ApiError::Timeout | ApiError::Cancelled)) => return Err(e),
+            Err(_) => return Ok(false),
+        };
         c.id = Some(id);
         c.generation += 1;
         c.proven = false;
         diag::event("client_id_refreshed", json!({ "generation": c.generation }));
-        true
+        Ok(true)
     }
 
     fn mark_proven(&self, generation: u64) {
-        let mut c = self.client.lock().unwrap();
+        // This is only a hint; never wait for another scrape to record it.
+        let Ok(mut c) = self.client.try_lock() else { return };
         if c.generation == generation {
             c.proven = true;
         }
@@ -335,14 +369,17 @@ impl Api {
 
     /// GET with the client id added, within `net::REQUEST_DEADLINE` and `net::MAX_ATTEMPTS`.
     fn fetch(&self, url: &str, cancel: &Cancel) -> Result<Value, ApiError> {
-        let deadline = Instant::now() + net::REQUEST_DEADLINE;
+        self.fetch_until(url, cancel, Instant::now() + net::REQUEST_DEADLINE)
+    }
+
+    fn fetch_until(&self, url: &str, cancel: &Cancel, deadline: Instant) -> Result<Value, ApiError> {
         let mut may_refresh = true;
         let mut last = ApiError::Network;
         for attempt in 0..net::MAX_ATTEMPTS {
             if cancel.is_stale() {
                 return Err(ApiError::Cancelled);
             }
-            let (id, generation, id_proven) = self.client_id()?;
+            let (id, generation, id_proven) = self.client_id(deadline, cancel)?;
             let full = if url.contains("client_id=") {
                 url.to_string()
             } else {
@@ -350,8 +387,9 @@ impl Api {
             };
             let started = Instant::now();
             let reply = {
-                let _permit = self.gate.enter();
-                self.http.get(&full, self.token.as_deref())
+                let _permit = self.gate.enter(deadline, cancel)?;
+                let timeout = net::remaining(deadline, cancel)?.min(net::ATTEMPT_TIMEOUT);
+                self.http.get(&full, self.token.as_deref(), timeout)
             };
             let latency_ms = started.elapsed().as_millis() as u64;
             let wait = match reply {
@@ -368,7 +406,7 @@ impl Api {
                     let step = match net::next_step(r.status, r.retry_after, seen) {
                         Step::RefreshClientId => {
                             may_refresh = false;
-                            if self.refresh_client_id(generation) {
+                            if self.refresh_client_id(generation, deadline, cancel)? {
                                 continue;
                             }
                             net::next_step(
@@ -723,7 +761,7 @@ fn finish_within(mut child: Child, limit: Duration) -> Result<(ExitStatus, Strin
 /// Fallback listing for pages the API path does not cover. Returns yt-dlp's error text, if any.
 pub fn ytdlp_list(source: &str, token: Option<&str>, emit: &mut dyn FnMut(Vec<Track>)) -> Option<String> {
     let child = ytdlp(&["--flat-playlist", "--dump-json", source], token);
-    let mut child = match child {
+    let child = match child {
         Ok(c) => c,
         Err(e) => {
             return Some(format!(
@@ -732,6 +770,15 @@ pub fn ytdlp_list(source: &str, token: Option<&str>, emit: &mut dyn FnMut(Vec<Tr
             ));
         }
     };
+    list_child(child, emit, YTDLP_LIST_SILENCE, YTDLP_LIST_LIMIT)
+}
+
+fn list_child(
+    mut child: Child,
+    emit: &mut dyn FnMut(Vec<Track>),
+    silence: Duration,
+    limit: Duration,
+) -> Option<String> {
     let err = child.stderr.take().map(|mut e| {
         thread::spawn(move || {
             let mut s = String::new();
@@ -752,7 +799,7 @@ pub fn ytdlp_list(source: &str, token: Option<&str>, emit: &mut dyn FnMut(Vec<Tr
                 let quiet = started
                     .elapsed()
                     .saturating_sub(Duration::from_secs(heard.load(Ordering::Relaxed)));
-                if quiet > YTDLP_LIST_SILENCE || started.elapsed() > YTDLP_LIST_LIMIT {
+                if quiet > silence || started.elapsed() > limit {
                     stuck.store(true, Ordering::Relaxed);
                     let _ = child.lock().unwrap().kill();
                     return;
@@ -793,8 +840,22 @@ pub fn ytdlp_list(source: &str, token: Option<&str>, emit: &mut dyn FnMut(Vec<Tr
             protected: false,
         }]);
     }
+    // EOF on stdout does not mean the process exited. Keep the watchdog alive, and
+    // release the mutex between polls so it can kill a child that is still running.
+    loop {
+        let status = child.lock().unwrap().try_wait();
+        match status {
+            Ok(Some(_)) => break,
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                let mut child = child.lock().unwrap();
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
     finished.store(true, Ordering::Relaxed);
-    let _ = child.lock().unwrap().wait();
     if stuck.load(Ordering::Relaxed) {
         return Some("yt-dlp stopped responding".to_string());
     }
@@ -834,7 +895,7 @@ pub mod mock {
     }
 
     impl Transport for Arc<Mock> {
-        fn get(&self, url: &str, oauth: Option<&str>) -> Result<Reply, Failure> {
+        fn get(&self, url: &str, oauth: Option<&str>, _timeout: Duration) -> Result<Reply, Failure> {
             self.calls
                 .lock()
                 .unwrap()
@@ -921,6 +982,164 @@ pub mod mock {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_timed_out_bundle_does_not_hide_a_later_client_id() {
+        struct Bundles;
+        impl Transport for Bundles {
+            fn get(&self, url: &str, _: Option<&str>, _: Duration) -> Result<Reply, Failure> {
+                let body = match url {
+                    "https://soundcloud.com" => {
+                        r#""https://a-v2.sndcdn.com/assets/good.js" "https://a-v2.sndcdn.com/assets/slow.js""#
+                            .to_string()
+                    }
+                    "https://a-v2.sndcdn.com/assets/slow.js" => return Err(Failure::Timeout),
+                    "https://a-v2.sndcdn.com/assets/good.js" => format!("client_id:\"{}\"", mock::ID_B),
+                    _ => "{}".to_string(),
+                };
+                Ok(Reply {
+                    status: 200,
+                    retry_after: None,
+                    body,
+                })
+            }
+            fn final_url(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+        let (mut api, _, _) = mock::api(vec![], None);
+        api.http = Box::new(Bundles);
+        api.client.lock().unwrap().id = None;
+        assert_eq!(api.get("https://example.test/tracks"), Ok(json!({})));
+        assert_eq!(api.client.lock().unwrap().id.as_deref(), Some(mock::ID_B));
+    }
+
+    #[test]
+    fn expired_requests_do_not_start_http() {
+        let (api, mock, _) = mock::api(vec![], None);
+        let result = api.fetch_until("https://example.test/tracks", &Cancel::never(), Instant::now());
+        assert_eq!(result, Err(ApiError::Timeout));
+        assert!(mock.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn queued_requests_respect_the_deadline() {
+        let (mut api, mock, _) = mock::api(vec![], None);
+        api.gate = Gate::new(1);
+        thread::scope(|scope| {
+            let permit = api
+                .gate
+                .enter(Instant::now() + net::REQUEST_DEADLINE, &Cancel::never())
+                .unwrap();
+            let (tx, rx) = mpsc::channel();
+            let api = &api;
+            scope.spawn(move || {
+                let result = api.fetch_until(
+                    "https://example.test/tracks",
+                    &Cancel::never(),
+                    Instant::now() + Duration::from_millis(50),
+                );
+                let _ = tx.send(result);
+            });
+            let result = rx.recv_timeout(Duration::from_secs(1));
+            drop(permit);
+            assert_eq!(result.unwrap(), Err(ApiError::Timeout));
+        });
+        assert!(mock.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn waiting_for_client_id_respects_the_deadline() {
+        let (api, mock, _) = mock::api(vec![], None);
+        thread::scope(|scope| {
+            let guard = api.client.lock().unwrap();
+            let (tx, rx) = mpsc::channel();
+            let api = &api;
+            scope.spawn(move || {
+                let result = api.fetch_until(
+                    "https://example.test/tracks",
+                    &Cancel::never(),
+                    Instant::now() + Duration::from_millis(50),
+                );
+                let _ = tx.send(result);
+            });
+            let result = rx.recv_timeout(Duration::from_secs(1));
+            drop(guard);
+            assert_eq!(result.unwrap(), Err(ApiError::Timeout));
+        });
+        assert!(mock.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn requests_cancel_while_waiting_for_capacity_or_client_id() {
+        for hold_client in [false, true] {
+            let (mut api, mock, _) = mock::api(vec![], None);
+            api.gate = Gate::new(1);
+            let epoch = Arc::new(AtomicU64::new(0));
+            let cancel = Cancel::tied_to(&epoch);
+            thread::scope(|scope| {
+                let guard = hold_client.then(|| api.client.lock().unwrap());
+                let permit = (!hold_client).then(|| {
+                    api.gate
+                        .enter(Instant::now() + net::REQUEST_DEADLINE, &Cancel::never())
+                        .unwrap()
+                });
+                let (tx, rx) = mpsc::channel();
+                let api = &api;
+                scope.spawn(move || {
+                    let _ = tx.send(api.fetch("https://example.test/tracks", &cancel));
+                });
+                // First verify the request is still queued, then cancel it without
+                // releasing capacity or the client-ID lock.
+                assert!(matches!(
+                    rx.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                epoch.fetch_add(1, Ordering::Relaxed);
+                let result = rx.recv_timeout(Duration::from_secs(1));
+                drop(guard);
+                drop(permit);
+                assert_eq!(result.unwrap(), Err(ApiError::Cancelled));
+            });
+            assert!(mock.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_slow_response_body_uses_the_remaining_deadline() {
+        use std::net::TcpListener;
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/tracks", server.local_addr().unwrap());
+        let (mut api, _, _) = mock::api(vec![], None);
+        api.http = Box::new(Ureq(
+            ureq::Agent::config_builder()
+                .proxy(None)
+                .timeout_global(Some(net::ATTEMPT_TIMEOUT))
+                .http_status_as_error(false)
+                .build()
+                .into(),
+        ));
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (mut socket, _) = server.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                thread::sleep(Duration::from_millis(250));
+                let _ = socket.write_all(b"{}");
+            });
+            let result = api.fetch_until(&url, &Cancel::never(), Instant::now() + Duration::from_millis(100));
+            assert_eq!(result, Err(ApiError::Timeout));
+        });
+    }
 
     fn transcoding(preset: &str, protocol: &str, url: &str) -> Value {
         json!({ "preset": preset, "url": url, "format": { "protocol": protocol } })
@@ -1237,6 +1456,43 @@ mod tests {
             ytdlp_errors("Reading options from STDIN\nERROR: https://x/a?client_id=1 failed"),
             "ERROR: https://x/a?<redacted> failed"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_timeout_still_applies_after_stdout_closes() {
+        let child = Command::new("sh")
+            .args(["-c", "exec 1>&-; exec sleep 1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = list_child(child, &mut |_| {}, Duration::from_millis(50), Duration::from_secs(5));
+        assert_eq!(result.as_deref(), Some("yt-dlp stopped responding"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_completed_listing_preserves_tracks_and_errors() {
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                r#"echo '{"url":"https://soundcloud.com/a/song","title":"Song"}'; echo oops >&2"#,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut tracks = Vec::new();
+        let result = list_child(
+            child,
+            &mut |page| tracks.extend(page),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "Song");
+        assert_eq!(result.as_deref(), Some("oops"));
     }
 
     #[cfg(unix)]

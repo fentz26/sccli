@@ -7,7 +7,7 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Attempts for one logical request, including the first.
@@ -131,6 +131,17 @@ pub fn backoff(attempt: u32, seed: u64) -> Duration {
     Duration::from_millis(ceiling / 2 + x % (ceiling / 2 + 1))
 }
 
+/// Check cancellation and the shared deadline before starting another blocking operation.
+pub fn remaining(deadline: Instant, cancel: &Cancel) -> Result<Duration, ApiError> {
+    if cancel.is_stale() {
+        return Err(ApiError::Cancelled);
+    }
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or(ApiError::Timeout)
+}
+
 /// Limits how many requests run at once.
 pub struct Gate {
     free: Mutex<usize>,
@@ -147,13 +158,19 @@ impl Gate {
         }
     }
 
-    pub fn enter(&self) -> Permit<'_> {
+    pub fn enter(&self, deadline: Instant, cancel: &Cancel) -> Result<Permit<'_>, ApiError> {
         let mut free = self.free.lock().unwrap();
-        while *free == 0 {
-            free = self.freed.wait(free).unwrap();
+        loop {
+            let left = remaining(deadline, cancel)?;
+            if *free > 0 {
+                *free -= 1;
+                return Ok(Permit(self));
+            }
+            (free, _) = self
+                .freed
+                .wait_timeout(free, left.min(Duration::from_millis(100)))
+                .unwrap();
         }
-        *free -= 1;
-        Permit(self)
     }
 }
 
@@ -267,7 +284,7 @@ mod tests {
             .map(|_| {
                 let (gate, peak) = (gate.clone(), peak.clone());
                 std::thread::spawn(move || {
-                    let _p = gate.enter();
+                    let _p = gate.enter(Instant::now() + REQUEST_DEADLINE, &Cancel::never()).unwrap();
                     {
                         let mut g = peak.lock().unwrap();
                         g.0 += 1;
