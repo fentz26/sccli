@@ -1,4 +1,4 @@
-//! The player: event loop, playback queue, and the Queue and Settings tabs.
+//! The player: event loop, playback queue, and the Queue, Settings and About tabs.
 
 use crate::{
     api::{self, Api, StreamError, Track},
@@ -45,8 +45,18 @@ pub enum Ev {
     /// Fresh full list, replacing the cached one that is on screen.
     Replace(Vec<Track>),
     Url(String, Result<String, Option<String>>), // Err(None): protected stream
+    /// Result of an update check; Ok(None) means nothing newer is published.
+    Update(Result<Option<String>, ()>),
     Key(KeyEvent),
     Resize,
+}
+
+enum UpdateCheck {
+    NotRun,
+    Running,
+    Current,
+    Available(String),
+    Failed,
 }
 
 /// Lists a source. With a cached list on screen, collects quietly and swaps it in at the end.
@@ -93,6 +103,16 @@ fn spawn_stream(api: Arc<Api>, t: Track, q: Quality, token: Option<String>, tx: 
     });
 }
 
+fn spawn_update_check(api: Arc<Api>, tx: Sender<Ev>) {
+    thread::spawn(move || {
+        let r = api
+            .latest_version()
+            .map(|v| v.filter(|v| api::is_newer(v, crate::VERSION)))
+            .map_err(|_| ());
+        let _ = tx.send(Ev::Update(r));
+    });
+}
+
 fn shuffle<T>(v: &mut [T]) {
     let mut x = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64 | 1;
     for i in (1..v.len()).rev() {
@@ -122,6 +142,7 @@ enum View {
     Player,
     Queue,
     Settings,
+    About,
 }
 
 struct App {
@@ -155,6 +176,7 @@ struct App {
     sel: usize,
     top: usize,
     set_sel: usize,
+    update: UpdateCheck,
     hover: Option<Instant>,
     saved_pos: Instant,
     // What is on screen now, so only changes are written.
@@ -254,6 +276,13 @@ impl App {
             Ev::Key(k) if k.kind != KeyEventKind::Release => self.key(k.code, k.modifiers),
             Ev::Key(_) => {}
             Ev::Resize => self.frame.clear(),
+            Ev::Update(r) => {
+                self.update = match r {
+                    Ok(Some(v)) => UpdateCheck::Available(v),
+                    Ok(None) => UpdateCheck::Current,
+                    Err(()) => UpdateCheck::Failed,
+                };
+            }
             Ev::MpvReady(s) => self.mpv.ready(s),
             Ev::MpvFailed(e) => {
                 self.note = e;
@@ -440,7 +469,7 @@ impl App {
     fn settings_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         match code {
             KeyCode::Char('l') | KeyCode::Char('q') | KeyCode::Char(',') | KeyCode::Esc => self.set_view(View::Player),
-            KeyCode::Tab => self.set_view(View::Queue),
+            KeyCode::Tab => self.set_view(View::About),
             KeyCode::Up | KeyCode::Char('k') => self.set_sel = self.set_sel.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => self.set_sel = (self.set_sel + 1).min(SETTINGS - 1),
             KeyCode::Right | KeyCode::Enter => self.change(1),
@@ -449,10 +478,27 @@ impl App {
         }
     }
 
+    fn about_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        match code {
+            KeyCode::Char('l') | KeyCode::Char('q') | KeyCode::Esc => self.set_view(View::Player),
+            KeyCode::Char(',') => self.set_view(View::Settings),
+            KeyCode::Tab => self.set_view(View::Queue),
+            KeyCode::Enter => {
+                if !matches!(self.update, UpdateCheck::Running) {
+                    self.update = UpdateCheck::Running;
+                    self.dirty = true;
+                    spawn_update_check(self.api.clone(), self.tx.clone());
+                }
+            }
+            _ => self.play_key(code, mods),
+        }
+    }
+
     fn key(&mut self, code: KeyCode, mods: KeyModifiers) {
         match self.view {
             View::Queue => self.queue_key(code, mods),
             View::Settings => self.settings_key(code, mods),
+            View::About => self.about_key(code, mods),
             View::Player => self.play_key(code, mods),
         }
     }
@@ -670,9 +716,10 @@ impl App {
             }
         };
         format!(
-            "{} {}",
+            "{} {} {}",
             tab(K::TabQueue, self.view == View::Queue),
-            tab(K::TabSettings, self.view == View::Settings)
+            tab(K::TabSettings, self.view == View::Settings),
+            tab(K::TabAbout, self.view == View::About)
         )
     }
 
@@ -704,6 +751,24 @@ impl App {
             let row = clip(&format!("   {name}{pad}   ‹ {value} ›"), w);
             out.push(if i == self.set_sel { reverse(&row) } else { row });
         }
+    }
+
+    fn about_rows(&self, w: usize, out: &mut Vec<String>) {
+        out.push(clip(tr(K::AboutHint), w));
+        out.push(format!("   scc {}", crate::VERSION));
+        out.push("   © 2026 Fentz · MIT License".to_string());
+        out.push(clip("   https://github.com/fentz26/sccli", w));
+        out.push(clip("   contact@fentz.dev", w));
+        out.push(String::new());
+        out.push(reverse(&clip(&format!("   {}", tr(K::CheckUpdates)), w)));
+        let result = match &self.update {
+            UpdateCheck::NotRun => return,
+            UpdateCheck::Running => tr(K::Checking).to_string(),
+            UpdateCheck::Current => tr(K::UpToDate).to_string(),
+            UpdateCheck::Available(v) => tr(K::UpdateAvailable).replace("{v}", v),
+            UpdateCheck::Failed => tr(K::UpdateFailed).to_string(),
+        };
+        out.push(clip(&format!("   {result}"), w));
     }
 
     /// Writes only what changed, in one go. Nothing at all is written when nothing changed:
@@ -739,6 +804,7 @@ impl App {
             let mut out = vec![self.tabs()];
             match self.view {
                 View::Settings => self.settings_rows(w, &mut out),
+                View::About => self.about_rows(w, &mut out),
                 _ => self.queue_rows(w, rows, &mut out),
             }
             out.resize(h - 1, String::new());
@@ -829,6 +895,7 @@ pub fn run(source: String, cfg: Config, looping: bool, shuffle_on: bool, resume:
         sel: 0,
         top: 0,
         set_sel: 0,
+        update: UpdateCheck::NotRun,
         hover: None,
         saved_pos: Instant::now(),
         dirty: true,

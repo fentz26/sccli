@@ -22,6 +22,7 @@ const API: &str = "https://api-v2.soundcloud.com";
 const UA: &str = "Mozilla/5.0";
 const PAGE: usize = 200;
 const IDS_PER_CALL: usize = 50;
+const RELEASES: &str = "https://api.github.com/repos/fentz26/sccli/releases/latest";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Track {
@@ -85,6 +86,12 @@ fn with_query(url: &str, params: &[(&str, Option<&str>)]) -> String {
         }
     }
     out
+}
+
+/// Whether `latest` is a later calendar version than `current`, such as 26.10 after 26.02.
+pub fn is_newer(latest: &str, current: &str) -> bool {
+    let parts = |v: &str| v.split('.').map(|p| p.parse().unwrap_or(0)).collect::<Vec<u32>>();
+    parts(latest) > parts(current)
 }
 
 /// Bitrate of a transcoding preset such as `aac_160k`; 0 for adaptive (`abr_*`), which is the last resort.
@@ -222,6 +229,20 @@ impl Api {
             }
         }
         Err(last.unwrap_or_else(|| anyhow::anyhow!("request failed")))
+    }
+
+    /// Latest published release, without the leading `v`. None: nothing is published yet.
+    /// Goes to GitHub, so the SoundCloud token is never attached.
+    pub fn latest_version(&self) -> Result<Option<String>> {
+        match self.text(RELEASES, false) {
+            Ok(s) => {
+                let v: Value = serde_json::from_str(&s)?;
+                let tag = v["tag_name"].as_str().context("no tag in release")?;
+                Ok(Some(tag.trim_start_matches('v').to_string()))
+            }
+            Err(ureq::Error::StatusCode(404)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn me(&self) -> Result<String> {
@@ -613,6 +634,16 @@ mod tests {
             ],
         );
         assert_eq!(url, "https://x/stream?track_authorization=a%20b&secret_token=s-1");
+    }
+
+    #[test]
+    fn compares_versions_as_numbers() {
+        assert!(is_newer("26.02", "26.01"));
+        assert!(is_newer("26.10", "26.09"));
+        assert!(is_newer("27.01", "26.12"));
+        assert!(is_newer("26.01.1", "26.01"));
+        assert!(!is_newer("26.01", "26.01"));
+        assert!(!is_newer("25.12", "26.01"));
     }
 
     #[test]

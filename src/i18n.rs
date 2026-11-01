@@ -81,9 +81,16 @@ pub enum K {
     Normal,
     High,
     Protected,
+    TabAbout,
+    AboutHint,
+    CheckUpdates,
+    Checking,
+    UpToDate,
+    UpdateAvailable,
+    UpdateFailed,
 }
 
-const TABLE: [[&str; 6]; 42] = [
+const TABLE: [[&str; 6]; 49] = [
     // Help
     [
         "space pause/resume · n next · b prev · s stop · ←/→ seek · ↑/↓ volume · l list · , settings · q quit",
@@ -227,11 +234,11 @@ const TABLE: [[&str; 6]; 42] = [
     ["Queue", "File d'attente", "播放队列", "キュー", "재생목록", "Cola"],
     ["Settings", "Réglages", "设置", "設定", "설정", "Ajustes"],
     [
-        "↑/↓ move · ←/→ change · space pause · tab queue · l/esc back",
-        "↑/↓ déplacer · ←/→ modifier · espace pause · tab file · l/échap retour",
-        "↑/↓ 移动 · ←/→ 更改 · 空格 暂停 · tab 队列 · l/esc 返回",
-        "↑/↓ 移動 · ←/→ 変更 · スペース 一時停止 · Tab キュー · l/Esc 戻る",
-        "↑/↓ 이동 · ←/→ 변경 · 스페이스 일시정지 · Tab 재생목록 · l/Esc 뒤로",
+        "↑/↓ move · ←/→ change · space pause · tab about · l/esc back",
+        "↑/↓ déplacer · ←/→ modifier · espace pause · tab à propos · l/échap retour",
+        "↑/↓ 移动 · ←/→ 更改 · 空格 暂停 · tab 关于 · l/esc 返回",
+        "↑/↓ 移動 · ←/→ 変更 · スペース 一時停止 · Tab 情報 · l/Esc 戻る",
+        "↑/↓ 이동 · ←/→ 변경 · 스페이스 일시정지 · Tab 정보 · l/Esc 뒤로",
         "↑/↓ mover · ←/→ cambiar · espacio pausa · tab cola · l/esc volver",
     ],
     // Setting names
@@ -335,6 +342,56 @@ const TABLE: [[&str; 6]; 42] = [
         "보호된 스트림, 건너뜀",
         "transmisión protegida, omitida",
     ],
+    // About tab
+    ["About", "À propos", "关于", "情報", "정보", "Acerca de"],
+    [
+        "enter check · space pause · tab queue · l/esc back",
+        "entrée vérifier · espace pause · tab file · l/échap retour",
+        "回车 检查 · 空格 暂停 · tab 队列 · l/esc 返回",
+        "Enter 確認 · スペース 一時停止 · Tab キュー · l/Esc 戻る",
+        "Enter 확인 · 스페이스 일시정지 · Tab 재생목록 · l/Esc 뒤로",
+        "intro comprobar · espacio pausa · tab cola · l/esc volver",
+    ],
+    [
+        "Check for updates",
+        "Rechercher des mises à jour",
+        "检查更新",
+        "アップデートを確認",
+        "업데이트 확인",
+        "Buscar actualizaciones",
+    ],
+    [
+        "Checking…",
+        "Vérification…",
+        "正在检查…",
+        "確認中…",
+        "확인 중…",
+        "Comprobando…",
+    ],
+    [
+        "You have the latest version",
+        "Vous avez la dernière version",
+        "已是最新版本",
+        "最新バージョンです",
+        "최신 버전입니다",
+        "Tienes la última versión",
+    ],
+    [
+        "Version {v} is available",
+        "La version {v} est disponible",
+        "新版本 {v} 可用",
+        "バージョン {v} が利用可能です",
+        "버전 {v}을(를) 사용할 수 있습니다",
+        "La versión {v} está disponible",
+    ],
+    [
+        "Could not check for updates",
+        "Impossible de vérifier les mises à jour",
+        "无法检查更新",
+        "アップデートを確認できませんでした",
+        "업데이트를 확인할 수 없습니다",
+        "No se pudo buscar actualizaciones",
+    ],
 ];
 
 pub fn tr(k: K) -> &'static str {
@@ -405,6 +462,7 @@ mod tests {
             (K::Queue, "{more}"),
             (K::SignedIn, "{user}"),
             (K::Skipped, "{e}"),
+            (K::UpdateAvailable, "{v}"),
         ] {
             assert!(TABLE[row as usize].iter().all(|s| s.contains(key)), "{key}");
         }

@@ -52,7 +52,7 @@ n  b        next / previous
 s           stop
 l           queue
 ,           settings
-tab         switch view
+tab         switch between Queue, Settings and About
 q           quit or close view
 Ctrl-C      quit
 ```
