@@ -539,8 +539,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "scc"
-version = "0.1.0"
+name = "sccli"
+version = "26.1.0"
 dependencies = [
  "anyhow",
  "clap",

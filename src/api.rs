@@ -359,10 +359,10 @@ impl Api {
 
     /// Direct playable URL. Stored track data can be stale, so failure re-reads the track once.
     pub fn stream(&self, t: &Track, q: Quality) -> Result<String, StreamError> {
-        if q == Quality::Original
-            && let Some(u) = self.original(t)
-        {
-            return Ok(u);
+        if q == Quality::Original {
+            if let Some(u) = self.original(t) {
+                return Ok(u);
+            }
         }
         if t.protected {
             return Err(StreamError::Protected);

@@ -1,14 +1,20 @@
 [package]
-name = "scc"
-version = "0.1.0"
+name = "sccli"
+version = "26.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.85"
 description = "Play SoundCloud in your terminal"
-repository = "https://github.com/fentz26/scc"
+authors = ["Fentz <contact@fentz.dev>"]
+license = "MIT"
+repository = "https://github.com/fentz26/sccli"
 readme = "README.md"
 keywords = ["soundcloud", "music", "player", "cli", "tui"]
 categories = ["command-line-utilities", "multimedia::audio"]
 publish = false
+
+[[bin]]
+name = "scc"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
