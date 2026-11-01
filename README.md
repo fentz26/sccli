@@ -1,72 +1,89 @@
-# scc
+# sccli
+
+[![CI](https://github.com/fentz26/sccli/actions/workflows/ci.yml/badge.svg)](https://github.com/fentz26/sccli/actions/workflows/ci.yml)
+[![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Play SoundCloud in your terminal: your likes, playlists, private sets and search.
-
-```sh
-scc login                                # sign in (paste your oauth_token)
-scc -p likes                             # your likes
-scc https://soundcloud.com/you/likes     # same thing
-scc https://soundcloud.com/artist/sets/name
-scc lofi hip hop                         # search and play
-scc                                      # continue the last song
-```
+The package is `sccli`, the command is `scc`.
 
 ## Install
 
-You need [Rust](https://rustup.rs) to build, `mpv` to play, and optionally `yt-dlp`.
-`yt-dlp` is only used for reposts, sets and albums pages, as a fallback, and by `scc login <browser>`.
-
-| System | Dependencies |
-|---|---|
-| Arch | `sudo pacman -S mpv yt-dlp` |
-| Ubuntu / Debian | `sudo apt install mpv yt-dlp` |
-| macOS | `brew install mpv yt-dlp` |
-| Windows | `scoop install mpv yt-dlp` |
-
-Then build it from this folder:
-
 ```sh
-cargo install --path .
+brew install fentz26/tap/sccli                                     # macOS, Linux
+yay -S sccli                                                       # Arch (AUR)
+sudo add-apt-repository ppa:LAUNCHPAD_USER/sccli                   # Ubuntu
+sudo apt install sccli                                             # Debian, Ubuntu
+cargo install --locked --git https://github.com/fentz26/sccli      # any system, Rust 1.85+
 ```
 
-## Sign in
+Or build from a clone:
 
-`scc login` asks you to paste your `oauth_token`:
+```sh
+git clone https://github.com/fentz26/sccli
+cd sccli
+cargo install --locked --path .
+```
 
-1. Log in at soundcloud.com.
-2. Open DevTools → Storage (Firefox, Safari) or Application (Chrome) → Cookies.
-3. Copy the value of `oauth_token`.
+Windows and other systems can download a binary from
+[Releases](https://github.com/fentz26/sccli/releases).
 
-`scc login chrome` (or `firefox`, `safari`, `brave`, `edge`) reads it from the browser instead.
-The token is saved in your config file, so treat that file like a password.
+Playback needs [mpv](https://mpv.io). [yt-dlp](https://github.com/yt-dlp/yt-dlp) is optional and
+only used for reposts, sets and albums pages, and as a fallback. Package managers install what
+they need; with Cargo or a binary, install them yourself.
+
+## Usage
+
+```sh
+scc login                                 # sign in
+scc -p likes                              # your likes
+scc https://soundcloud.com/artist/sets/name
+scc lofi hip hop                          # search and play
+scc                                       # continue the last song
+scc -s -r -p likes                        # shuffle and repeat
+scc -l ja -p likes                        # Japanese for this run
+scc alias gym https://soundcloud.com/you/sets/gym
+scc -p gym
+```
+
+`scc login` asks for your `oauth_token`. Log in at soundcloud.com, open your browser's DevTools,
+and copy the `oauth_token` value from Storage or Application → Cookies.
 
 ## Keys
 
-| Key | Player | Queue (`l`) | Settings (`,`) |
-|---|---|---|---|
-| `space` | pause / resume | pause / resume | pause / resume |
-| `↑` `↓` | volume | move | move |
-| `←` `→` | seek | seek | change value |
-| `enter` | pause / resume | play selected | next value |
-| `n` / `b` | next / previous | next / previous | next / previous |
-| `s` | stop | stop | stop |
-| `+` / `-` | volume | volume | volume |
-| `tab` | open Queue | to Settings | to Queue |
-| `q` | quit | close | close |
-
-`Ctrl-C` quits from anywhere. In the queue, `PgUp`, `PgDn`, `g` and `G` jump through the list.
-
-## Files
-
-| System | Settings and login | Cache |
-|---|---|---|
-| Linux | `~/.config/scc/` (or `$XDG_CONFIG_HOME`) | `~/.cache/scc/` (or `$XDG_CACHE_HOME`) |
-| macOS | `~/.config/scc/` | `~/.cache/scc/` |
-| Windows | `%APPDATA%\scc\` | `%LOCALAPPDATA%\scc\` |
-
-Deleting the cache is safe: the track list is fetched again on the next run.
+```text
+space       pause / resume
+←  →        seek
+↑  ↓        volume, or move in a list
+enter       play selected
+n  b        next / previous
+s           stop
+l           queue
+,           settings
+tab         switch view
+q           quit or close view
+```
 
 ## Language
 
-The interface follows your system language. Set it in Settings, with `scc lang ja`, or
-with `--lang` for one run. Supported: `en`, `fr`, `zh`, `ja`, `ko`, `es`.
+The interface follows your system language. Change it in Settings (`,`), or use `-l` for one
+run: `en`, `fr`, `zh`, `ja`, `ko`, `es`.
+
+## Verify a release
+
+Every release is built with [SLSA Build Level 3](https://slsa.dev/spec/v1.0/levels) provenance.
+Check an archive with [slsa-verifier](https://github.com/slsa-framework/slsa-verifier):
+
+```sh
+slsa-verifier verify-artifact sccli-26.01-x86_64-unknown-linux-musl.tar.gz \
+  --provenance-path sccli.intoto.jsonl \
+  --source-uri github.com/fentz26/sccli \
+  --source-tag v26.01
+```
+
+## Project
+
+- [License](LICENSE): MIT
+- [Security policy](SECURITY.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- Contact: contact@fentz.dev
