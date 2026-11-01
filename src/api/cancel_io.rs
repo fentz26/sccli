@@ -57,7 +57,9 @@ impl<T: Transport> Transport for PollTransport<T> {
         let started = Instant::now();
         loop {
             if self.cancel.is_stale() {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "request cancelled").into());
+                // Interrupted is retried by std::io::Read helpers, so it would
+                // spin through body reads until the overall timeout instead.
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "request cancelled").into());
             }
             let left = budget.after.saturating_sub(started.elapsed());
             if left.is_zero() {
@@ -94,39 +96,50 @@ mod tests {
     };
 
     #[test]
-    fn polling_reads_interrupt_a_waiting_response() {
+    fn polling_reads_interrupt_headers_and_partial_bodies() {
         use std::sync::{atomic::Ordering, mpsc};
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/slow", listener.local_addr().unwrap());
-        let epoch = Arc::new(AtomicU64::new(0));
-        let agent = agent(
-            Config::builder()
-                .proxy(None)
-                .timeout_global(Some(Duration::from_secs(3)))
-                .build(),
-            Cancel::tied_to(&epoch),
-        );
-        thread::scope(|scope| {
-            let (ready_tx, ready_rx) = mpsc::channel();
-            let (release_tx, release_rx) = mpsc::channel();
-            scope.spawn(move || {
-                let mut socket = crate::api::tests::accept_test_connection(&listener);
-                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                let mut request = [0; 4096];
-                assert!(socket.read(&mut request).unwrap() > 0);
-                ready_tx.send(()).unwrap();
-                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        for partial_body in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/slow", listener.local_addr().unwrap());
+            let epoch = Arc::new(AtomicU64::new(0));
+            let agent = agent(
+                Config::builder()
+                    .proxy(None)
+                    .timeout_global(Some(Duration::from_secs(3)))
+                    .build(),
+                Cancel::tied_to(&epoch),
+            );
+            thread::scope(|scope| {
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                scope.spawn(move || {
+                    let mut socket = crate::api::tests::accept_test_connection(&listener);
+                    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut request = [0; 4096];
+                    assert!(socket.read(&mut request).unwrap() > 0);
+                    if partial_body {
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{")
+                            .unwrap();
+                    }
+                    ready_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                });
+                let (result_tx, result_rx) = mpsc::channel();
+                scope.spawn(move || {
+                    let result = agent
+                        .get(&url)
+                        .call()
+                        .and_then(|mut response| response.body_mut().read_to_string());
+                    let _ = result_tx.send(result.is_err());
+                });
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                epoch.fetch_add(1, Ordering::Relaxed);
+                let result = result_rx.recv_timeout(Duration::from_secs(1));
+                let _ = release_tx.send(());
+                assert!(result.unwrap(), "partial_body={partial_body}");
             });
-            let (result_tx, result_rx) = mpsc::channel();
-            scope.spawn(move || {
-                let _ = result_tx.send(agent.get(&url).call().is_err());
-            });
-            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            epoch.fetch_add(1, Ordering::Relaxed);
-            let result = result_rx.recv_timeout(Duration::from_secs(1));
-            let _ = release_tx.send(());
-            assert!(result.unwrap());
-        });
+        }
     }
 
     #[test]
