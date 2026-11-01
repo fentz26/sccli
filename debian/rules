@@ -23,5 +23,9 @@ override_dh_auto_install:
 override_dh_auto_clean:
 	rm -rf target debian/cargo-home
 
+# Vendored crates need their Cargo.toml.orig files, which dh_clean would delete.
+override_dh_clean:
+	dh_clean -XCargo.toml.orig
+
 # Release builds are already stripped.
 override_dh_dwz:
