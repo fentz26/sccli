@@ -1,14 +1,15 @@
 //! The player: event loop, playback queue, and the Queue and Settings tabs.
 
 use crate::{
+    api::requests::{ApiError, Cancel},
     api::{self, Api, Track},
     config::{self, Config, Last, Memory, Quality, Repeat},
-    diag,
-    i18n::{self, K, clip, tr, width},
-    ipc,
-    mpv::Mpv,
-    net::{ApiError, Cancel},
-    playback::{End, Loss, MAX_RECOVERIES, Phase, Playback, Tick},
+    log,
+    player::{
+        Mpv, ipc,
+        state::{End, Loss, MAX_RECOVERIES, Phase, Playback, Tick},
+    },
+    ui::text::{self, K, clip, tr, width},
 };
 use anyhow::{Result, bail};
 use crossterm::{
@@ -116,7 +117,7 @@ fn spawn_stream(api: Arc<Api>, t: Track, q: Quality, token: Option<String>, canc
             api::ytdlp_stream(&t.url, token.as_deref()).map_err(|detail| StreamFailure { error, detail })
         });
         if let Err(f) = &r {
-            diag::event(
+            log::event(
                 "stream_failed",
                 json!({ "error": f.error.to_string(), "detail": f.detail }),
             );
@@ -363,7 +364,7 @@ impl App {
         self.seek_to = (pos > 1.0).then_some(pos);
         self.want = Some(self.cur);
         self.dirty = true;
-        diag::event("recovery", json!({ "attempt": self.pb.attempts(), "pos": pos }));
+        log::event("recovery", json!({ "attempt": self.pb.attempts(), "pos": pos }));
         self.request(self.cur);
     }
 
@@ -385,7 +386,7 @@ impl App {
     /// Recovery ran out. Stays on the song and says why, so nothing is skipped unseen; enter
     /// tries again and `n` moves on.
     fn hold(&mut self) {
-        diag::event("recovery_failed", json!({ "pos": self.time, "offline": self.offline }));
+        log::event("recovery_failed", json!({ "pos": self.time, "offline": self.offline }));
         self.mpv.send(json!(["set_property", "pause", true]));
         self.say(
             tr(if self.offline {
@@ -586,7 +587,7 @@ impl App {
             Some("playback-restart") => self.pb.restarted(now),
             Some("end-file") => {
                 let reason = v["reason"].as_str();
-                diag::event(
+                log::event(
                     "end_file",
                     json!({ "reason": reason, "error": v["file_error"], "entry": entry, "pos": self.time, "dur": self.dur }),
                 );
@@ -736,16 +737,16 @@ impl App {
         let s = &mut self.cfg.settings;
         match self.set_sel {
             0 => {
-                let n = i18n::CODES.len() as i32 + 1;
+                let n = text::CODES.len() as i32 + 1;
                 let now = self
                     .cfg
                     .lang
                     .as_deref()
-                    .and_then(i18n::parse_lang)
+                    .and_then(text::parse_lang)
                     .map_or(0, |l| l as i32 + 1);
                 let next = (now + dir).rem_euclid(n) as usize;
-                self.cfg.lang = (next > 0).then(|| i18n::CODES[next - 1].to_string());
-                i18n::set_lang(i18n::detect_lang(None, self.cfg.lang.as_deref()));
+                self.cfg.lang = (next > 0).then(|| text::CODES[next - 1].to_string());
+                text::set_lang(text::detect_lang(None, self.cfg.lang.as_deref()));
             }
             1 => {
                 s.quality = cycle(&[Quality::Original, Quality::Best, Quality::Saver], s.quality, dir);
@@ -781,8 +782,8 @@ impl App {
         match i {
             0 => (
                 tr(K::SetLanguage),
-                match self.cfg.lang.as_deref().and_then(i18n::parse_lang) {
-                    Some(l) => i18n::NAMES[l as usize].to_string(),
+                match self.cfg.lang.as_deref().and_then(text::parse_lang) {
+                    Some(l) => text::NAMES[l as usize].to_string(),
                     None => tr(K::Auto).to_string(),
                 },
             ),
@@ -835,7 +836,7 @@ impl App {
             Tick::Retry(pos) => self.reload(pos),
         }
         if self.pb.phase() != self.shown_phase {
-            diag::event(
+            log::event(
                 "phase",
                 json!({
                     "from": format!("{:?}", self.shown_phase),
