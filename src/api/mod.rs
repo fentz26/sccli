@@ -5,7 +5,9 @@ use crate::{
     config::{self, Quality},
     log,
 };
+mod process;
 pub mod requests;
+use process::Child;
 
 use anyhow::{Context, Result};
 use requests::{self as net, ApiError, Cancel, Gate, Seen, Step};
@@ -13,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex, MutexGuard, TryLockError,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -746,13 +748,13 @@ fn ytdlp(args: &[&str], token: Option<&str>) -> std::io::Result<Child> {
     if token.is_some() {
         cmd.args(["--config-locations", "-"]);
     }
-    let mut child = cmd
-        .arg("--no-warnings")
-        .args(args)
-        .stdin(if token.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = Child::spawn(
+        cmd.arg("--no-warnings")
+            .args(args)
+            .stdin(if token.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(ytdlp_options(token).as_bytes());
     }
@@ -1674,17 +1676,48 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn listing_timeout_terminates_the_descendant() {
+        let child = Child::spawn(Command::new("sh")
+            .args(["-c", r#"sleep 30 & pid=$!; printf '{"url":"https://soundcloud.com/a/song","title":"%s"}\n' "$pid"; wait"#])
+            .stdout(Stdio::piped()).stderr(Stdio::piped())).unwrap();
+        let mut tracks = Vec::new();
+        let result = list_child(
+            child,
+            &mut |page| tracks.extend(page),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        );
+        assert_eq!(result.as_deref(), Some("yt-dlp stopped responding"));
+        let pid = &tracks[0].title;
+        let stopped = || {
+            let status = Command::new("ps").args(["-o", "stat=", "-p", pid]).output().unwrap();
+            let state = String::from_utf8_lossy(&status.stdout);
+            state.trim().is_empty() || state.trim_start().starts_with('Z')
+        };
+        let stop = Instant::now() + Duration::from_secs(2);
+        while !stopped() && Instant::now() < stop {
+            thread::sleep(Duration::from_millis(25));
+        }
+        let terminated = stopped();
+        // Always clean up if the regression is present.
+        let _ = Command::new("kill").args(["-9", pid]).output();
+        assert!(terminated, "descendant {pid} survived the listing watchdog");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_clean_listing_completes_when_a_descendant_holds_a_pipe() {
         for script in [
             r#"echo '{"url":"https://soundcloud.com/a/song","title":"Song"}'; sleep 4 & exit 0"#,
             r#"echo '{"url":"https://soundcloud.com/a/song","title":"Song"}'; exec 1>&-; sleep 4 & exit 0"#,
         ] {
-            let child = Command::new("sh")
-                .args(["-c", script])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
+            let child = Child::spawn(
+                Command::new("sh")
+                    .args(["-c", script])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped()),
+            )
+            .unwrap();
             let mut tracks = Vec::new();
             let started = Instant::now();
             let error = list_child(
@@ -1702,12 +1735,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn listing_timeout_still_applies_after_stdout_closes() {
-        let child = Command::new("sh")
-            .args(["-c", "exec 1>&-; exec sleep 30"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let child = Child::spawn(
+            Command::new("sh")
+                .args(["-c", "exec 1>&-; exec sleep 30"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
         let t0 = Instant::now();
         let result = list_child(child, &mut |_| {}, Duration::from_millis(50), Duration::from_secs(5));
         assert_eq!(result.as_deref(), Some("yt-dlp stopped responding"));
@@ -1719,12 +1753,13 @@ mod tests {
     #[test]
     fn listing_timeout_does_not_wait_for_grandchild_pipes() {
         for script in ["sleep 4 & exec sleep 30", "exec 1>&-; sleep 4 & exec sleep 30"] {
-            let child = Command::new("sh")
-                .args(["-c", script])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
+            let child = Child::spawn(
+                Command::new("sh")
+                    .args(["-c", script])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped()),
+            )
+            .unwrap();
             let t0 = Instant::now();
             let result = list_child(child, &mut |_| {}, Duration::from_millis(50), Duration::from_secs(5));
             assert_eq!(result.as_deref(), Some("yt-dlp stopped responding"));
@@ -1739,15 +1774,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_completed_listing_preserves_tracks_and_errors() {
-        let child = Command::new("sh")
-            .args([
-                "-c",
-                r#"echo '{"url":"https://soundcloud.com/a/song","title":"Song"}'; echo oops >&2"#,
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let child = Child::spawn(
+            Command::new("sh")
+                .args([
+                    "-c",
+                    r#"echo '{"url":"https://soundcloud.com/a/song","title":"Song"}'; echo oops >&2"#,
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
         let mut tracks = Vec::new();
         let result = list_child(
             child,
@@ -1763,12 +1799,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_stuck_program_is_killed_at_its_limit() {
-        let child = Command::new("sh")
-            .args(["-c", "exec sleep 30"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let child = Child::spawn(
+            Command::new("sh")
+                .args(["-c", "exec sleep 30"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
         let t0 = Instant::now();
         assert!(finish_within(child, Duration::from_millis(150)).is_err());
         assert!(t0.elapsed() < Duration::from_secs(5));
@@ -1777,12 +1814,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_noisy_program_cannot_fill_its_pipe_and_hang() {
-        let child = Command::new("sh")
-            .args(["-c", "head -c 2000000 /dev/zero | tr '\\0' x; echo oops >&2"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let child = Child::spawn(
+            Command::new("sh")
+                .args(["-c", "head -c 2000000 /dev/zero | tr '\\0' x; echo oops >&2"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
         let (_, out, err) = finish_within(child, Duration::from_secs(20)).unwrap();
         assert_eq!(out.len(), 2_000_000);
         assert_eq!(err.trim(), "oops");
