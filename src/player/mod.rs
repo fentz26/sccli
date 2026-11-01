@@ -1,7 +1,10 @@
 //! mpv process and its IPC socket. Startup never blocks the UI: commands sent before the
 //! socket is ready wait in `pending`.
 
-use crate::{app::Ev, config::Settings, ipc};
+pub mod ipc;
+pub mod state;
+
+use crate::{app::Ev, config::Settings};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{
@@ -23,6 +26,16 @@ pub fn install_hint(tool: &str) -> String {
     }
 }
 
+const PROPERTIES: [&str; 7] = [
+    "pause",
+    "time-pos",
+    "duration",
+    "volume",
+    "paused-for-cache",
+    "seeking",
+    "demuxer-cache-duration",
+];
+
 pub struct Mpv {
     child: Child,
     conn: Option<ipc::Conn>,
@@ -32,6 +45,16 @@ pub struct Mpv {
 
 impl Mpv {
     pub fn start(s: &Settings, tx: Sender<Ev>) -> Result<Mpv> {
+        Self::start_with(s, tx, &[])
+    }
+
+    /// For tests: machines without a sound device must not fail, and nothing should be heard.
+    #[cfg(test)]
+    pub fn start_silent(s: &Settings, tx: Sender<Ev>) -> Result<Mpv> {
+        Self::start_with(s, tx, &["--ao=null"])
+    }
+
+    fn start_with(s: &Settings, tx: Sender<Ev>, extra: &[&str]) -> Result<Mpv> {
         let addr = ipc::address();
         let (ahead, back, secs) = s.memory.mpv();
         let child = Command::new("mpv")
@@ -48,12 +71,15 @@ impl Mpv {
                 "--load-stats-overlay=no",
                 "--load-auto-profiles=no",
                 "--cache=yes",
+                // Without this a dead connection holds mpv for its default 60 seconds.
+                "--network-timeout=20",
             ])
             .arg(format!("--cache-secs={secs}"))
             .arg(format!("--demuxer-max-bytes={ahead}"))
             .arg(format!("--demuxer-max-back-bytes={back}"))
             .arg(format!("--volume={}", s.volume))
             .arg(format!("--input-ipc-server={addr}"))
+            .args(extra)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -93,7 +119,7 @@ impl Mpv {
 
     pub fn ready(&mut self, conn: ipc::Conn) {
         self.conn = Some(conn);
-        for (i, p) in ["pause", "time-pos", "duration", "volume"].iter().enumerate() {
+        for (i, p) in PROPERTIES.iter().enumerate() {
             self.send(json!(["observe_property", i + 1, p]));
         }
         for c in std::mem::take(&mut self.pending) {

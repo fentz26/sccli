@@ -1,11 +1,15 @@
 //! The player: event loop, playback queue, and the Queue and Settings tabs.
 
 use crate::{
-    api::{self, Api, StreamError, Track},
+    api::requests::{ApiError, Cancel},
+    api::{self, Api, Track},
     config::{self, Config, Last, Memory, Quality, Repeat},
-    i18n::{self, K, clip, tr, width},
-    ipc,
-    mpv::Mpv,
+    log,
+    player::{
+        Mpv, ipc,
+        state::{End, Loss, MAX_RECOVERIES, Phase, Playback, Tick},
+    },
+    ui::text::{self, K, clip, tr, width},
 };
 use anyhow::{Result, bail};
 use crossterm::{
@@ -22,6 +26,7 @@ use std::{
     io::{Write, stdout},
     sync::{
         Arc,
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError, Sender},
     },
     thread,
@@ -35,6 +40,14 @@ const HOVER_DELAY: Duration = Duration::from_millis(120);
 const SAVE_POS_EVERY: Duration = Duration::from_secs(10);
 const NOTE_FOR: Duration = Duration::from_secs(5);
 const SETTINGS: usize = 9;
+/// Link lookups running at once for songs nobody is waiting for yet.
+const MAX_PREFETCH: usize = 3;
+
+/// Why a song has no link, with text fit to show.
+pub struct StreamFailure {
+    error: ApiError,
+    detail: String,
+}
 
 pub enum Ev {
     Mpv(Value),
@@ -44,7 +57,7 @@ pub enum Ev {
     ListDone(Option<String>),
     /// Fresh full list, replacing the cached one that is on screen.
     Replace(Vec<Track>),
-    Url(String, Result<String, Option<String>>), // Err(None): protected stream
+    Url(String, Quality, Result<String, StreamFailure>),
     /// Result of an update check; Ok(None) means nothing newer is published.
     Update(Result<Option<String>, ()>),
     Key(KeyEvent),
@@ -92,14 +105,24 @@ fn spawn_list(api: Arc<Api>, source: String, token: Option<String>, cached: bool
     });
 }
 
-fn spawn_stream(api: Arc<Api>, t: Track, q: Quality, token: Option<String>, tx: Sender<Ev>) {
+fn spawn_stream(api: Arc<Api>, t: Track, q: Quality, token: Option<String>, cancel: Cancel, tx: Sender<Ev>) {
     thread::spawn(move || {
-        let r = match api.stream(&t, q) {
-            Ok(u) => Ok(u),
-            Err(StreamError::Protected) => Err(None),
-            Err(StreamError::Other) => api::ytdlp_stream(&t.url, token.as_deref()).map_err(Some),
-        };
-        let _ = tx.send(Ev::Url(t.url, r));
+        let r = api.stream(&t, q, &cancel).or_else(|error| {
+            let no_fallback =
+                error.is_transient() || matches!(error, ApiError::Protected | ApiError::Cancelled | ApiError::Auth);
+            if no_fallback {
+                let detail = error.to_string();
+                return Err(StreamFailure { error, detail });
+            }
+            api::ytdlp_stream(&t.url, token.as_deref()).map_err(|detail| StreamFailure { error, detail })
+        });
+        if let Err(f) = &r {
+            log::event(
+                "stream_failed",
+                json!({ "error": f.error.to_string(), "detail": f.detail }),
+            );
+        }
+        let _ = tx.send(Ev::Url(t.url, q, r));
     });
 }
 
@@ -160,7 +183,14 @@ struct App {
     cur: usize,
     want: Option<usize>, // song waiting for its link, or for the list to reach it
     back: bool,          // last move was backwards, so unplayable songs skip that way
-    retried: bool,
+    pb: Playback,
+    /// Moves on with every song change, which cancels link lookups for the old one.
+    epoch: Arc<AtomicU64>,
+    /// The last lookup could not reach SoundCloud, so failures are about the connection.
+    offline: bool,
+    shown_phase: Phase,
+    phase_at: Instant,
+    cached_secs: f64,
     resume: Option<Last>,
     seek_to: Option<f64>,
     paused: bool,
@@ -187,6 +217,65 @@ struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        api: Arc<Api>,
+        cfg: Config,
+        tx: Sender<Ev>,
+        mpv: Mpv,
+        source: String,
+        repeat: Repeat,
+        tracks: Vec<Track>,
+        resume: Option<Last>,
+    ) -> Self {
+        let volume = cfg.settings.volume as f64;
+        App {
+            api,
+            cfg,
+            tx,
+            mpv,
+            source,
+            repeat,
+            shuffled: false,
+            shuffle_pending: false,
+            tracks,
+            list_done: false,
+            urls: HashMap::new(),
+            inflight: HashSet::new(),
+            cur: 0,
+            want: None,
+            back: false,
+            pb: Playback::new(Instant::now()),
+            epoch: Arc::new(AtomicU64::new(0)),
+            offline: false,
+            shown_phase: Phase::Resolving,
+            phase_at: Instant::now(),
+            cached_secs: 0.0,
+            resume,
+            seek_to: None,
+            paused: false,
+            stopped: false,
+            time: 0.0,
+            dur: 0.0,
+            volume,
+            note: String::new(),
+            note_at: Instant::now(),
+            quit: false,
+            view: View::Player,
+            sel: 0,
+            top: 0,
+            set_sel: 0,
+            update: UpdateCheck::NotRun,
+            hover: None,
+            saved_pos: Instant::now(),
+            dirty: true,
+            frame: vec![],
+            frame_size: (0, 0),
+            line: String::new(),
+            title: String::new(),
+        }
+    }
+
     fn url_of(&self, i: usize) -> Option<String> {
         let t = self.tracks.get(i)?;
         self.urls
@@ -195,8 +284,13 @@ impl App {
             .map(|u| u.0.clone())
     }
 
+    /// Fetches a link. Anything but the current song waits for free capacity.
     fn request(&mut self, idx: usize) {
         let Some(t) = self.tracks.get(idx) else { return };
+        let needed = self.want == Some(idx);
+        if !needed && self.inflight.len() >= MAX_PREFETCH {
+            return;
+        }
         if self.url_of(idx).is_none() && self.inflight.insert(t.url.clone()) {
             let token = self.cfg.token.clone();
             spawn_stream(
@@ -204,12 +298,26 @@ impl App {
                 t.clone(),
                 self.cfg.settings.quality,
                 token,
+                Cancel::tied_to(&self.epoch),
                 self.tx.clone(),
             );
         }
     }
 
-    fn go(&mut self, mut idx: usize) {
+    fn load(&mut self, url: String) {
+        self.want = None;
+        self.pb.loading(Instant::now());
+        self.mpv.send(json!(["set_property", "pause", false]));
+        self.mpv.send(json!(["loadfile", url, "replace"]));
+    }
+
+    /// Plays a song chosen now, from its start.
+    fn go(&mut self, idx: usize) {
+        self.seek_to = None;
+        self.play(idx);
+    }
+
+    fn play(&mut self, mut idx: usize) {
         self.resume = None;
         self.dirty = true;
         if idx >= self.tracks.len() {
@@ -230,15 +338,14 @@ impl App {
             self.sel = idx; // the cursor follows the song unless you moved it away
         }
         config::save_last(&self.source, &self.tracks[idx].url, 0.0);
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+        self.pb.select(Instant::now());
         self.time = 0.0;
         self.dur = self.tracks[idx].secs as f64;
         self.stopped = false;
+        self.offline = false;
         match self.url_of(idx) {
-            Some(u) => {
-                self.want = None;
-                self.mpv.send(json!(["set_property", "pause", false]));
-                self.mpv.send(json!(["loadfile", u, "replace"]));
-            }
+            Some(u) => self.load(u),
             None => {
                 self.want = Some(idx);
                 self.request(idx);
@@ -250,16 +357,60 @@ impl App {
         self.urls.retain(|_, u| u.1.elapsed() < URL_TTL);
     }
 
+    /// Replaces the current song's link and continues from `pos`.
+    fn reload(&mut self, pos: f64) {
+        let Some(t) = self.tracks.get(self.cur) else { return };
+        self.urls.remove(&t.url);
+        self.seek_to = (pos > 1.0).then_some(pos);
+        self.want = Some(self.cur);
+        self.dirty = true;
+        log::event("recovery", json!({ "attempt": self.pb.attempts(), "pos": pos }));
+        self.request(self.cur);
+    }
+
+    /// The song cannot continue. Connection trouble holds the place; a bad stream moves on.
+    fn on_lost(&mut self, loss: Loss) {
+        self.dirty = true;
+        match loss {
+            Loss::Retrying(n) => {
+                self.say(
+                    tr(K::Reconnecting)
+                        .replace("{n}", &n.to_string())
+                        .replace("{max}", &MAX_RECOVERIES.to_string()),
+                );
+            }
+            Loss::GaveUp => self.hold(),
+        }
+    }
+
+    /// Recovery ran out. Stays on the song and says why, so nothing is skipped unseen; enter
+    /// tries again and `n` moves on.
+    fn hold(&mut self) {
+        log::event("recovery_failed", json!({ "pos": self.time, "offline": self.offline }));
+        self.mpv.send(json!(["set_property", "pause", true]));
+        self.say(
+            tr(if self.offline {
+                K::ConnectionLost
+            } else {
+                K::StreamFailed
+            })
+            .into(),
+        );
+    }
+
+    fn say(&mut self, text: String) {
+        self.note_at = Instant::now();
+        self.note = text;
+    }
+
     fn start_at_resume(&mut self) {
         let Some(last) = self.resume.take() else {
             return self.go(0);
         };
         match self.tracks.iter().position(|t| t.url == last.track) {
             Some(i) => {
-                if self.cfg.settings.resume_pos && last.pos > 0.0 {
-                    self.seek_to = Some(last.pos);
-                }
-                self.go(i);
+                self.seek_to = (self.cfg.settings.resume_pos && last.pos > 0.0).then_some(last.pos);
+                self.play(i);
             }
             None => self.go(0), // the song left the list; start from the top
         }
@@ -267,7 +418,7 @@ impl App {
 
     fn handle(&mut self, ev: Ev) {
         // Position updates arrive many times a second; only a new second changes the screen.
-        let quiet = matches!(&ev, Ev::Mpv(v) if v["name"] == "time-pos");
+        let quiet = matches!(&ev, Ev::Mpv(v) if v["name"] == "time-pos" || v["name"] == "demuxer-cache-duration");
         if !quiet {
             self.dirty = true;
         }
@@ -299,11 +450,14 @@ impl App {
                         self.start_at_resume();
                     }
                 } else if let Some(w) = self.want.filter(|&w| w < self.tracks.len()) {
-                    self.go(w);
+                    self.play(w);
                 }
             }
             Ev::ListDone(err) => {
                 self.list_done = true;
+                if let Some(e) = err.as_ref().filter(|e| !e.is_empty() && !self.tracks.is_empty()) {
+                    self.say(tr(K::ListIncomplete).replace("{e}", e));
+                }
                 if self.tracks.is_empty() {
                     self.note = err.filter(|e| !e.is_empty()).unwrap_or_else(|| tr(K::NoTracks).into());
                     self.quit = true;
@@ -314,33 +468,57 @@ impl App {
                 } else if self.resume.is_some() {
                     self.start_at_resume();
                 } else if let Some(w) = self.want {
-                    self.go(w);
+                    self.play(w);
                 }
             }
             Ev::Replace(new) => self.replace_list(new),
-            Ev::Url(key, r) => {
-                self.inflight.remove(&key);
-                let wanted = self.want.filter(|w| self.tracks.get(*w).is_some_and(|t| t.url == key));
-                match r {
-                    Ok(u) => {
-                        self.urls.insert(key, (u, Instant::now()));
-                        if let Some(w) = wanted {
-                            self.go(w);
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(w) = wanted {
-                            self.note_at = Instant::now();
-                            self.note = match e {
-                                Some(e) => tr(K::Skipped).replace("{e}", &e),
-                                None => tr(K::Protected).into(),
-                            };
-                            self.skip_from(w);
-                        }
+            Ev::Url(key, q, r) => self.on_url(key, q, r),
+            Ev::Mpv(v) => self.mpv_event(&v),
+        }
+    }
+
+    fn on_url(&mut self, key: String, q: Quality, r: Result<String, StreamFailure>) {
+        self.inflight.remove(&key);
+        let wanted = self.want.filter(|w| self.tracks.get(*w).is_some_and(|t| t.url == key));
+        let failure = match r {
+            Ok(u) if q == self.cfg.settings.quality => {
+                self.urls.insert(key, (u, Instant::now()));
+                if let Some(w) = wanted {
+                    self.offline = false;
+                    if self.pb.recovering() {
+                        let url = self.url_of(w).unwrap_or_default();
+                        self.load(url);
+                    } else {
+                        self.play(w);
                     }
                 }
+                return;
             }
-            Ev::Mpv(v) => self.mpv_event(&v),
+            // Asked for under a setting since changed, or cancelled while still needed.
+            Ok(_) => None,
+            Err(f) if f.error == ApiError::Cancelled => None,
+            Err(f) => Some(f),
+        };
+        let Some(w) = wanted else { return };
+        let Some(f) = failure else { return self.request(w) };
+        match f.error {
+            ApiError::Protected => {
+                self.say(tr(K::Protected).into());
+                self.skip_from(w);
+            }
+            ApiError::Auth => {
+                self.say(f.detail);
+                self.pb.fail();
+            }
+            e if e.is_transient() => {
+                self.offline = true;
+                let loss = self.pb.lost(Instant::now());
+                self.on_lost(loss);
+            }
+            _ => {
+                self.say(tr(K::Skipped).replace("{e}", &f.detail));
+                self.skip_from(w);
+            }
         }
     }
 
@@ -368,55 +546,62 @@ impl App {
     }
 
     fn mpv_event(&mut self, v: &Value) {
+        let now = Instant::now();
+        let entry = v["playlist_entry_id"].as_i64();
         match v["event"].as_str() {
             Some("property-change") => {
                 let d = &v["data"];
                 match v["name"].as_str() {
-                    Some("pause") => self.paused = d.as_bool().unwrap_or(false),
+                    Some("pause") => {
+                        self.paused = d.as_bool().unwrap_or(false);
+                        self.pb.set_paused(self.paused, now);
+                    }
+                    Some("paused-for-cache") => self.pb.set_cache_wait(d.as_bool().unwrap_or(false)),
+                    Some("seeking") => self.pb.set_seeking(d.as_bool().unwrap_or(false), now),
+                    Some("demuxer-cache-duration") => self.cached_secs = d.as_f64().unwrap_or(0.0),
                     Some("time-pos") => {
                         let t = d.as_f64().unwrap_or(0.0);
-                        if t as u64 != self.time as u64 {
-                            self.dirty = true;
+                        if self.pb.time_pos(t, now) {
+                            if t as u64 != self.time as u64 {
+                                self.dirty = true;
+                            }
+                            self.time = t;
                         }
-                        self.time = t;
                     }
                     Some("duration") => {
-                        if let Some(d) = d.as_f64() {
+                        if let Some(d) = d.as_f64().filter(|_| self.pb.started()) {
                             self.dur = d;
+                            self.pb.set_duration(d);
                         }
                     }
                     Some("volume") => self.volume = d.as_f64().unwrap_or(100.0),
                     _ => {}
                 }
             }
-            Some("file-loaded") => {
+            Some("start-file") => self.pb.start_file(entry),
+            Some("file-loaded") if self.pb.started() => {
                 if let Some(p) = self.seek_to.take() {
                     self.mpv.send(json!(["seek", p, "absolute"]));
                 }
             }
-            Some("playback-restart") => self.retried = false,
-            Some("end-file") => match v["reason"].as_str() {
-                Some("eof") if self.repeat == Repeat::One => self.go(self.cur),
-                Some("eof") => {
-                    self.back = false;
-                    self.go(self.cur + 1)
-                }
-                Some("error") if !self.retried => {
-                    // A stored link may have gone stale: get a fresh one before giving up on the song.
-                    self.retried = true;
-                    if let Some(t) = self.tracks.get(self.cur) {
-                        self.urls.remove(&t.url);
+            Some("playback-restart") => self.pb.restarted(now),
+            Some("end-file") => {
+                let reason = v["reason"].as_str();
+                log::event(
+                    "end_file",
+                    json!({ "reason": reason, "error": v["file_error"], "entry": entry, "pos": self.time, "dur": self.dur }),
+                );
+                match self.pb.end_file(reason, entry, self.dur, now) {
+                    End::Ignored => {}
+                    End::Finished if self.repeat == Repeat::One => self.go(self.cur),
+                    End::Finished => {
+                        self.back = false;
+                        self.go(self.cur + 1)
                     }
-                    self.go(self.cur);
+                    End::Lost(loss) => self.on_lost(loss),
+                    End::CutOffAgain => self.hold(),
                 }
-                Some("error") => {
-                    self.retried = false;
-                    self.note_at = Instant::now();
-                    self.note = tr(K::StreamFailed).into();
-                    self.skip_from(self.cur);
-                }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
@@ -501,6 +686,12 @@ impl App {
             KeyCode::Char(',') => self.set_view(View::Settings),
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.quit = true,
+            KeyCode::Char(' ') | KeyCode::Enter if self.pb.phase() == Phase::Failed => {
+                self.mpv.send(json!(["set_property", "pause", false]));
+                self.note.clear();
+                let pos = self.pb.retry_now(Instant::now());
+                self.reload(pos);
+            }
             KeyCode::Char(' ') | KeyCode::Enter => {
                 if self.stopped {
                     self.stopped = false;
@@ -546,16 +737,16 @@ impl App {
         let s = &mut self.cfg.settings;
         match self.set_sel {
             0 => {
-                let n = i18n::CODES.len() as i32 + 1;
+                let n = text::CODES.len() as i32 + 1;
                 let now = self
                     .cfg
                     .lang
                     .as_deref()
-                    .and_then(i18n::parse_lang)
+                    .and_then(text::parse_lang)
                     .map_or(0, |l| l as i32 + 1);
                 let next = (now + dir).rem_euclid(n) as usize;
-                self.cfg.lang = (next > 0).then(|| i18n::CODES[next - 1].to_string());
-                i18n::set_lang(i18n::detect_lang(None, self.cfg.lang.as_deref()));
+                self.cfg.lang = (next > 0).then(|| text::CODES[next - 1].to_string());
+                text::set_lang(text::detect_lang(None, self.cfg.lang.as_deref()));
             }
             1 => {
                 s.quality = cycle(&[Quality::Original, Quality::Best, Quality::Saver], s.quality, dir);
@@ -591,8 +782,8 @@ impl App {
         match i {
             0 => (
                 tr(K::SetLanguage),
-                match self.cfg.lang.as_deref().and_then(i18n::parse_lang) {
-                    Some(l) => i18n::NAMES[l as usize].to_string(),
+                match self.cfg.lang.as_deref().and_then(text::parse_lang) {
+                    Some(l) => text::NAMES[l as usize].to_string(),
                     None => tr(K::Auto).to_string(),
                 },
             ),
@@ -632,11 +823,32 @@ impl App {
     }
 
     fn tick(&mut self) {
-        if !self.note.is_empty() && !self.tracks.is_empty() && self.note_at.elapsed() >= NOTE_FOR {
+        let holding = self.pb.phase() == Phase::Failed; // the reason stays until it is dealt with
+        if !self.note.is_empty() && !self.tracks.is_empty() && !holding && self.note_at.elapsed() >= NOTE_FOR {
             self.note.clear();
             self.dirty = true;
         }
         // Fetch the link of the song under the cursor once it stops moving, so Enter has no wait.
+        let now = Instant::now();
+        match self.pb.tick(now) {
+            Tick::Nothing => {}
+            Tick::Lost(loss) => self.on_lost(loss),
+            Tick::Retry(pos) => self.reload(pos),
+        }
+        if self.pb.phase() != self.shown_phase {
+            log::event(
+                "phase",
+                json!({
+                    "from": format!("{:?}", self.shown_phase),
+                    "to": format!("{:?}", self.pb.phase()),
+                    "held_ms": now.duration_since(self.phase_at).as_millis() as u64,
+                    "cached_secs": self.cached_secs,
+                }),
+            );
+            self.shown_phase = self.pb.phase();
+            self.phase_at = now;
+            self.dirty = true;
+        }
         if self.hover.is_some_and(|t| t.elapsed() >= HOVER_DELAY) {
             self.hover = None;
             self.request(self.sel);
@@ -654,26 +866,27 @@ impl App {
     }
 
     fn state_word(&self) -> &'static str {
-        tr(if self.want.is_some() {
-            K::Loading
-        } else if self.stopped {
-            K::Stopped
-        } else if self.paused {
-            K::Paused
-        } else {
-            K::Playing
+        tr(match self.pb.phase() {
+            Phase::Resolving => K::Loading,
+            Phase::Buffering => K::Buffering,
+            Phase::Stalled => K::Stalled,
+            Phase::Recovering => K::Recovering,
+            Phase::Failed => K::ConnectionLost,
+            Phase::Playing if self.stopped => K::Stopped,
+            Phase::Playing if self.paused => K::Paused,
+            Phase::Playing => K::Playing,
         })
     }
 
     fn status(&self) -> String {
-        let icon = if self.want.is_some() {
-            "…"
-        } else if self.stopped {
-            "■"
-        } else if self.paused {
-            "⏸"
-        } else {
-            "▶"
+        let icon = match self.pb.phase() {
+            Phase::Resolving | Phase::Buffering => "…",
+            Phase::Stalled => "!",
+            Phase::Recovering => "↻",
+            Phase::Failed => "✕",
+            Phase::Playing if self.stopped => "■",
+            Phase::Playing if self.paused => "⏸",
+            Phase::Playing => "▶",
         };
         let waiting = tr(if self.shuffle_pending { K::Shuffle } else { K::Loading });
         let title = self
@@ -852,47 +1065,11 @@ pub fn run(source: String, cfg: Config, looping: bool, shuffle_on: bool, resume:
 
     let mpv = Mpv::start(&cfg.settings, tx.clone())?;
     let repeat = if looping { Repeat::All } else { cfg.settings.repeat };
-    let volume = cfg.settings.volume as f64;
-    let mut app = App {
-        api,
-        cfg,
-        tx: tx.clone(),
-        mpv,
-        source,
-        repeat,
-        shuffled: shuffle_on,
-        shuffle_pending: shuffle_on && !have_cache,
-        tracks: cached.unwrap_or_default(),
-        list_done: have_cache,
-        urls: HashMap::new(),
-        inflight: HashSet::new(),
-        cur: 0,
-        want: None,
-        back: false,
-        retried: false,
-        resume,
-        seek_to: None,
-        paused: false,
-        stopped: false,
-        time: 0.0,
-        dur: 0.0,
-        volume,
-        note: String::new(),
-        note_at: Instant::now(),
-        quit: false,
-        view: View::Player,
-        sel: 0,
-        top: 0,
-        set_sel: 0,
-        update: UpdateCheck::NotRun,
-        hover: None,
-        saved_pos: Instant::now(),
-        dirty: true,
-        frame: vec![],
-        frame_size: (0, 0),
-        line: String::new(),
-        title: String::new(),
-    };
+    let tracks = cached.unwrap_or_default();
+    let mut app = App::new(api, cfg, tx.clone(), mpv, source, repeat, tracks, resume);
+    app.shuffled = shuffle_on;
+    app.shuffle_pending = shuffle_on && !have_cache;
+    app.list_done = have_cache;
     // Any cursor command turns on escape sequences in Windows consoles; harmless elsewhere.
     execute!(stdout(), Show)?;
     println!("{}\n", tr(K::Help));
@@ -960,4 +1137,282 @@ pub fn run(source: String, cfg: Config, looping: bool, shuffle_on: bool, resume:
         bail!("{}", app.note);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::mock::{self, ok};
+    use std::{
+        io::{BufRead, BufReader},
+        net::TcpListener,
+    };
+
+    const BYTES_PER_SEC: usize = 8000;
+    const SECONDS: usize = 60;
+
+    /// One minute of quiet 8 kHz audio.
+    fn wav() -> Vec<u8> {
+        let data = BYTES_PER_SEC * SECONDS;
+        let mut w = b"RIFF".to_vec();
+        w.extend(((36 + data) as u32).to_le_bytes());
+        w.extend(b"WAVEfmt ");
+        w.extend(16u32.to_le_bytes());
+        w.extend(1u16.to_le_bytes());
+        w.extend(1u16.to_le_bytes());
+        w.extend((BYTES_PER_SEC as u32).to_le_bytes());
+        w.extend((BYTES_PER_SEC as u32).to_le_bytes());
+        w.extend(1u16.to_le_bytes());
+        w.extend(8u16.to_le_bytes());
+        w.extend(b"data");
+        w.extend((data as u32).to_le_bytes());
+        w.resize(44 + data, 128);
+        w
+    }
+
+    /// `/cut` drops the connection a few seconds in and then refuses to continue, as an expired
+    /// link does.
+    /// Anything else serves the whole file, with the ranges mpv needs to seek.
+    fn serve() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let file = Arc::new(wav());
+        thread::spawn(move || {
+            for conn in listener.incoming().map_while(Result::ok) {
+                let file = file.clone();
+                thread::spawn(move || {
+                    let mut lines = BufReader::new(conn.try_clone().unwrap()).lines().map_while(Result::ok);
+                    let path = lines.next().unwrap_or_default();
+                    let mut from = 0usize;
+                    for l in lines.by_ref().take_while(|l| !l.is_empty()) {
+                        if let Some(r) = l.to_lowercase().strip_prefix("range: bytes=") {
+                            from = r.split('-').next().unwrap_or("0").parse().unwrap_or(0);
+                        }
+                    }
+                    let mut conn = conn;
+                    if path.contains("/cut") && from > 0 {
+                        let _ = conn.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+                        return;
+                    }
+                    let total = file.len();
+                    let part = &file[from.min(total)..];
+                    let head = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: audio/wav\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nContent-Range: bytes {from}-{}/{total}\r\nConnection: close\r\n\r\n",
+                        if from > 0 { "206 Partial Content" } else { "200 OK" },
+                        part.len(),
+                        total - 1,
+                    );
+                    let _ = conn.write_all(head.as_bytes());
+                    if path.contains("/hang") {
+                        if from == 0 {
+                            let _ = conn.write_all(&part[..5 * BYTES_PER_SEC]);
+                        }
+                        // Connected and sending nothing. A reconnect hangs too, or mpv's own
+                        // timeout could race the stall detection and fix it unseen.
+                        thread::sleep(Duration::from_secs(120));
+                        return;
+                    }
+                    let keep = if path.contains("/cut") {
+                        5 * BYTES_PER_SEC
+                    } else {
+                        part.len()
+                    };
+                    let _ = conn.write_all(&part[..keep.min(part.len())]);
+                });
+            }
+        });
+        base
+    }
+
+    fn track(url: &str, secs: u32) -> Track {
+        Track {
+            id: 7,
+            url: url.to_string(),
+            title: "song".into(),
+            secs,
+            best: Some("https://x/media".into()),
+            low: None,
+            auth: None,
+            secret: None,
+            downloadable: false,
+            protected: false,
+        }
+    }
+
+    /// Runs the real event loop, without a terminal, until `done` or a time limit.
+    fn run_until(app: &mut App, rx: &mpsc::Receiver<Ev>, limit: Duration, done: impl Fn(&App) -> bool) {
+        let stop = Instant::now() + limit;
+        while Instant::now() < stop && !done(app) {
+            if let Ok(ev) = rx.recv_timeout(Duration::from_millis(50)) {
+                app.handle(ev);
+            }
+            app.tick();
+        }
+    }
+
+    fn app_with(links: &[String]) -> (App, mpsc::Receiver<Ev>, Arc<mock::Mock>) {
+        let script = links.iter().map(|l| ok(&json!({ "url": l }).to_string())).collect();
+        let (api, m, _) = mock::api(script, None);
+        let (tx, rx) = mpsc::channel();
+        let settings = crate::config::Settings {
+            preload: 0,
+            volume: 0,
+            ..Default::default()
+        };
+        let mpv = Mpv::start_silent(&settings, tx.clone()).unwrap();
+        let cfg = Config {
+            settings,
+            ..Config::default()
+        };
+        let tracks = vec![
+            track("https://soundcloud.com/a/one", 60),
+            track("https://soundcloud.com/a/two", 60),
+        ];
+        let mut app = App::new(Arc::new(api), cfg, tx, mpv, "test".into(), Repeat::Off, tracks, None);
+        app.list_done = true;
+        (app, rx, m)
+    }
+
+    fn connect(app: &mut App, rx: &mpsc::Receiver<Ev>) {
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ev::MpvReady(conn)) => app.mpv.ready(conn),
+            _ => panic!("mpv did not connect"),
+        }
+    }
+
+    #[test]
+    #[ignore = "needs mpv installed"]
+    fn a_stream_cut_off_mid_song_resumes_in_place_instead_of_skipping() {
+        let base = serve();
+        let links = [format!("{base}/cut"), format!("{base}/whole")];
+        let (mut app, rx, _) = app_with(&links);
+        connect(&mut app, &rx);
+        app.go(0);
+
+        run_until(&mut app, &rx, Duration::from_secs(20), |a| a.time >= 3.0);
+        assert!(app.time >= 3.0, "never started, phase {:?}", app.pb.phase());
+        let lost_at = app.time;
+
+        run_until(&mut app, &rx, Duration::from_secs(30), |a| {
+            a.pb.attempts() >= 1 && a.pb.phase() == Phase::Playing && a.time > lost_at + 2.0
+        });
+        assert_eq!(app.cur, 0, "skipped to the next song");
+        assert!(app.pb.attempts() >= 1, "the cut was not noticed");
+        assert_eq!(app.pb.phase(), Phase::Playing);
+        assert!(
+            app.time > lost_at,
+            "restarted from {} after losing it at {lost_at}",
+            app.time
+        );
+    }
+
+    #[test]
+    #[ignore = "needs mpv installed"]
+    fn old_events_cannot_disturb_a_newly_chosen_song() {
+        let base = serve();
+        let links = [format!("{base}/one"), format!("{base}/two"), format!("{base}/three")];
+        let (mut app, rx, _) = app_with(&links);
+        connect(&mut app, &rx);
+        app.go(0);
+        run_until(&mut app, &rx, Duration::from_secs(20), |a| a.time >= 1.0);
+        app.go(1);
+        app.go(0);
+        app.go(1);
+        run_until(&mut app, &rx, Duration::from_secs(20), |a| {
+            a.pb.phase() == Phase::Playing && a.time >= 1.0
+        });
+        assert_eq!(app.cur, 1);
+        assert_eq!(app.pb.attempts(), 0);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    #[ignore = "needs mpv installed"]
+    fn a_frozen_connection_is_noticed_and_recovered() {
+        let base = serve();
+        let links = [format!("{base}/hang"), format!("{base}/whole")];
+        let (mut app, rx, _) = app_with(&links);
+        connect(&mut app, &rx);
+        app.go(0);
+        run_until(&mut app, &rx, Duration::from_secs(20), |a| a.time >= 3.0);
+        let lost_at = app.time;
+        run_until(&mut app, &rx, Duration::from_secs(45), |a| {
+            a.pb.attempts() >= 1 && a.pb.phase() == Phase::Playing && a.time > lost_at + 2.0
+        });
+        assert_eq!(app.cur, 0, "skipped to the next song");
+        assert!(app.pb.attempts() >= 1, "the freeze was not noticed");
+        assert_eq!(app.pb.phase(), Phase::Playing);
+        assert!(app.time > lost_at, "restarted from {} after {lost_at}", app.time);
+    }
+
+    #[test]
+    #[ignore = "needs mpv installed"]
+    fn losing_the_network_holds_the_place_until_asked_to_retry() {
+        let base = serve();
+        let (mut app, rx, m) = app_with(&[format!("{base}/cut")]);
+        m.script
+            .lock()
+            .unwrap()
+            .extend((0..200).map(|_| Err(crate::api::Failure::Network)));
+        connect(&mut app, &rx);
+        app.go(0);
+        run_until(&mut app, &rx, Duration::from_secs(20), |a| a.time >= 3.0);
+        let lost_at = app.time;
+
+        run_until(&mut app, &rx, Duration::from_secs(60), |a| {
+            a.pb.phase() == Phase::Failed
+        });
+        assert_eq!(app.pb.phase(), Phase::Failed, "kept retrying without end");
+        assert_eq!(app.cur, 0, "connection loss skipped the song");
+        assert!(!app.quit);
+        assert!(app.status().contains(tr(K::ConnectionLost)), "{}", app.status());
+
+        m.script.lock().unwrap().clear();
+        m.script
+            .lock()
+            .unwrap()
+            .push_back(ok(&json!({ "url": format!("{base}/whole") }).to_string()));
+        app.play_key(KeyCode::Enter, KeyModifiers::NONE);
+        run_until(&mut app, &rx, Duration::from_secs(20), |a| {
+            a.pb.phase() == Phase::Playing && a.time > lost_at
+        });
+        assert_eq!(app.pb.phase(), Phase::Playing);
+        assert!(app.time > lost_at, "lost the position: {} after {lost_at}", app.time);
+    }
+
+    #[test]
+    #[ignore = "needs mpv installed"]
+    fn a_stream_that_keeps_ending_early_holds_the_song_and_says_why() {
+        let base = serve();
+        let (mut app, rx, m) = app_with(&vec![format!("{base}/cut"); 12]);
+        connect(&mut app, &rx);
+        app.go(0);
+        run_until(&mut app, &rx, Duration::from_secs(20), |a| a.time >= 3.0);
+        let lost_at = app.time;
+
+        run_until(&mut app, &rx, Duration::from_secs(90), |a| {
+            a.pb.phase() == Phase::Failed
+        });
+        assert_eq!(app.pb.phase(), Phase::Failed, "kept retrying without end");
+        assert_eq!(app.cur, 0, "moved on from the song");
+        assert!(!app.quit);
+
+        // The reason outlasts the normal note time.
+        app.note_at = Instant::now() - NOTE_FOR * 2;
+        app.tick();
+        assert!(app.status().contains(tr(K::StreamFailed)), "{}", app.status());
+
+        m.script.lock().unwrap().clear();
+        m.script
+            .lock()
+            .unwrap()
+            .push_back(ok(&json!({ "url": format!("{base}/whole") }).to_string()));
+        app.play_key(KeyCode::Enter, KeyModifiers::NONE);
+        run_until(&mut app, &rx, Duration::from_secs(20), |a| {
+            a.pb.phase() == Phase::Playing && a.time > lost_at
+        });
+        assert_eq!(app.pb.phase(), Phase::Playing);
+        assert_eq!(app.cur, 0);
+        assert!(app.time > lost_at, "lost the position: {} after {lost_at}", app.time);
+    }
 }

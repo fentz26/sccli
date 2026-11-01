@@ -4,16 +4,16 @@
 mod api;
 mod app;
 mod config;
-mod i18n;
-mod ipc;
-mod mpv;
+mod log;
+mod player;
+mod ui;
 
 use anyhow::{Context, Result, bail};
 use api::Api;
 use clap::Parser;
 use config::{Config, load_config, load_last, save_config};
-use i18n::{K, detect_lang, parse_lang, set_lang, tr};
 use std::io::{Write, stdout};
+use ui::text::{K, detect_lang, parse_lang, set_lang, tr};
 
 /// Calendar version shown to users and used for tags and archives. Cargo needs SemVer, which
 /// forbids the leading zero, so Cargo.toml carries the same version as 26.1.0.
@@ -48,6 +48,9 @@ struct Cli {
     /// Interface language for this run: en, fr, zh, ja, ko, es (save it in Settings)
     #[arg(short, long, value_name = "LANG")]
     lang: Option<String>,
+    /// Write a diagnostic log with secrets removed to debug.log in the cache folder
+    #[arg(long)]
+    debug: bool,
     /// URL, search words, or a command: login | logout | alias
     target: Vec<String>,
 }
@@ -110,6 +113,11 @@ fn resolve_url_str(u: &str, cfg: &Config) -> Result<String> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.debug {
+        if let Some(path) = log::enable() {
+            eprintln!("debug log: {}", path.display());
+        }
+    }
     let mut cfg = load_config();
     if let Some(l) = cli.lang.as_deref().filter(|l| parse_lang(l).is_none()) {
         bail!("unsupported language '{l}' (en, fr, zh, ja, ko, es)");

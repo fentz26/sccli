@@ -73,6 +73,7 @@ scc -p likes
 ## Learn more
 
 - [Usage guide](docs/usage.md)
+- [Development](docs/development.md)
 - [Verify a release](docs/verify-release.md)
 - [Security policy](SECURITY.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)

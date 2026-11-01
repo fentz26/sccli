@@ -5,8 +5,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
@@ -96,7 +98,7 @@ fn config_dir() -> PathBuf {
         .join("scc")
 }
 
-fn cache_dir() -> PathBuf {
+pub fn cache_dir() -> PathBuf {
     let base = if cfg!(target_os = "macos") {
         None
     } else {
@@ -107,17 +109,27 @@ fn cache_dir() -> PathBuf {
         .join("scc")
 }
 
+/// A new file only you can read, private before the first byte goes in. Refuses a file that
+/// already exists, because someone else could already have it open.
+fn create_private(p: &Path) -> std::io::Result<fs::File> {
+    let mut open = OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)] // on Windows the per-user profile folder is already private
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    open.open(p)
+}
+
 /// Writes through a temp file so a crash cannot leave a half-written file, readable only by you.
 fn write_private(p: &Path, data: &str) -> Result<()> {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
     fs::create_dir_all(p.parent().unwrap())?;
-    let tmp = p.with_extension(format!("tmp{}", std::process::id()));
-    fs::write(&tmp, data)?;
-    #[cfg(unix)] // on Windows the per-user profile folder is already private
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let tmp = p.with_extension(format!("tmp{}-{n}", std::process::id()));
+    let written = create_private(&tmp).and_then(|mut f| f.write_all(data.as_bytes()));
+    if let Err(e) = written.and_then(|_| fs::rename(&tmp, p)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
     }
-    fs::rename(&tmp, p)?;
     Ok(())
 }
 
@@ -153,6 +165,9 @@ pub fn load_last() -> Option<Last> {
 }
 
 pub fn save_last(source: &str, track: &str, pos: f64) {
+    if cfg!(test) {
+        return; // tests must not touch the real resume file
+    }
     let l = Last {
         source: source.into(),
         track: track.into(),
@@ -214,5 +229,70 @@ mod tests {
     fn resume_file_from_older_versions_still_loads() {
         let l: Last = serde_json::from_str(r#"{"source":"s","track":"t"}"#).unwrap();
         assert_eq!(l.pos, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("scc-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn replaces_the_file_and_leaves_no_temp_behind() {
+        let dir = scratch("replace");
+        let file = dir.join("config.json");
+        write_private(&file, "one").unwrap();
+        write_private(&file, "two").unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "two");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secrets_are_private_from_the_first_byte() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("create");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tmp");
+        let _open = create_private(&file).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().len(), 0);
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(create_private(&file).is_err(), "reused an existing file");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_readable_file_becomes_private_when_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("mode");
+        let file = dir.join("config.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&file, "old").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&file, "token").unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_cannot_be_replaced_leaves_no_secret_behind() {
+        let dir = scratch("fail");
+        let target = dir.join("config.json");
+        fs::create_dir_all(target.join("not-empty")).unwrap(); // a directory blocks the rename
+        assert!(write_private(&target, "token").is_err());
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "temp file left with the secret in it"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }
