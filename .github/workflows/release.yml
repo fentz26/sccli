@@ -1,0 +1,186 @@
+name: Release
+
+# A v* tag builds the archives, signs SLSA Build Level 3 provenance, verifies it, and only then
+# creates a draft release. Pull requests touching the build run the same builds and stop there.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.lock
+      - Cargo.toml
+
+permissions:
+  contents: read
+
+env:
+  # Releases are built with one exact compiler, whatever `stable` means that day.
+  RUST_VERSION: 1.99.1
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read version and match it to the tag
+        id: read
+        run: |
+          version=$(sed -n 's/^const VERSION: &str = "\(.*\)";$/\1/p' src/main.rs)
+          test -n "$version"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, runs: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, runs: true }
+          - { target: aarch64-apple-darwin, os: macos-latest, runs: true }
+          - { target: x86_64-apple-darwin, os: macos-latest, runs: false }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, runs: true }
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+      - name: Install musl
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+      # No build cache here: release binaries must not depend on restored state.
+      - run: cargo build --release --locked --target "$TARGET"
+        shell: bash
+      - name: Check the binary
+        if: matrix.runs
+        shell: bash
+        run: |
+          out=$("target/$TARGET/release/scc" --version)
+          test "$out" = "scc $VERSION"
+      - name: Package
+        shell: bash
+        run: |
+          name="sccli-$VERSION-$TARGET"
+          mkdir -p "$name" dist
+          cp LICENSE README.md "$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "target/$TARGET/release/scc.exe" "$name/"
+            7z a -tzip "dist/$name.zip" "$name" > /dev/null
+          else
+            cp "target/$TARGET/release/scc" "$name/"
+            tar -czf "dist/$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  hashes:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: archive-*
+          merge-multiple: true
+      - name: Hash the archives
+        id: hash
+        working-directory: dist
+        run: |
+          sha256sum -- * | tee ../SHA256SUMS
+          echo "hashes=$(base64 -w0 ../SHA256SUMS)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: checksums
+          path: SHA256SUMS
+          if-no-files-found: error
+
+  provenance:
+    if: github.ref_type == 'tag'
+    needs: hashes
+    permissions:
+      actions: read # read the workflow run
+      contents: write # required by the generator, even without uploading assets
+      id-token: write # sign with the workflow's identity
+    # The SLSA generator must be referenced by tag, not by commit: slsa-verifier checks it.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.hashes.outputs.hashes }}
+      provenance-name: sccli.intoto.jsonl
+
+  verify:
+    if: github.ref_type == 'tag'
+    needs: provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: slsa-framework/slsa-verifier/actions/installer@v2.7.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: archive-*
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sccli.intoto.jsonl
+      - name: Verify every archive
+        run: |
+          for archive in dist/*; do
+            slsa-verifier verify-artifact "$archive" \
+              --provenance-path sccli.intoto.jsonl \
+              --source-uri "github.com/$GITHUB_REPOSITORY" \
+              --source-tag "$GITHUB_REF_NAME"
+          done
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the draft release
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: archive-*
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: checksums
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sccli.intoto.jsonl
+          path: dist
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --generate-notes
