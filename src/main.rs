@@ -93,6 +93,8 @@ fn resolve_url(cli: &Cli, cfg: &Config) -> Result<String> {
     let t = cli.target.join(" ");
     if t.starts_with("http") {
         resolve_url_str(&t, cfg)
+    } else if t.contains("soundcloud.com/") && !t.contains(' ') {
+        resolve_url_str(&format!("https://{t}"), cfg)
     } else {
         Ok(format!("scsearch25:{t}"))
     }
@@ -176,16 +178,37 @@ mod tests {
     }
 
     #[test]
-    fn readme_uses_the_current_version() {
-        let readme = include_str!("../README.md");
-        assert!(readme.contains(&format!("sccli-{VERSION}-")));
-        assert!(readme.contains(&format!("--source-tag v{VERSION}")));
+    fn docs_use_the_current_version() {
+        let guide = include_str!("../docs/verify-release.md");
+        assert!(guide.contains(&format!("sccli-{VERSION}-")));
+        assert!(guide.contains(&format!("--source-tag v{VERSION}")));
+    }
+
+    #[test]
+    fn ubuntu_package_matches_version() {
+        assert!(include_str!("../debian/changelog").starts_with(&format!("sccli ({VERSION}-1)")));
+    }
+
+    #[test]
+    fn links_work_without_a_scheme() {
+        let cli = Cli::try_parse_from(["scc", "soundcloud.com/artist/sets/name"]).unwrap();
+        let url = resolve_url(&cli, &Config::default()).unwrap();
+        assert_eq!(url, "https://soundcloud.com/artist/sets/name");
+    }
+
+    #[test]
+    fn search_words_stay_a_search() {
+        let cli = Cli::try_parse_from(["scc", "lofi", "hip", "hop"]).unwrap();
+        assert_eq!(
+            resolve_url(&cli, &Config::default()).unwrap(),
+            "scsearch25:lofi hip hop"
+        );
     }
 
     #[test]
     fn minimum_rust_version_is_stated_and_tested() {
         let msrv = env!("CARGO_PKG_RUST_VERSION");
-        assert!(include_str!("../README.md").contains(&format!("Rust {msrv}+")));
+        assert!(include_str!("../README.md").contains(&format!(") {msrv}+")));
         assert!(include_str!("../.github/workflows/ci.yml").contains(&format!("rust: [\"{msrv}\"")));
     }
 

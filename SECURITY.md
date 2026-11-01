@@ -19,4 +19,4 @@ to remove it.
 
 Release archives come with [SLSA Build Level 3](https://slsa.dev/spec/v1.0/levels) provenance,
 which proves that an archive was built by this repository's release workflow from a specific
-tag. See [Verify a release](README.md#verify-a-release).
+tag. See [Verify a release](docs/verify-release.md).
