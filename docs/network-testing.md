@@ -46,6 +46,23 @@ on its supported platforms, but does not assert identical timings or buffering c
 These cases did not trigger the stall timer while delivery continued, including a case
 that rebuffered. They provide no reason to change the current cache sizes.
 
+## Kernel shaping in CI
+
+The `network shaping (Linux)` job uses a disposable Ubuntu 24.04 runner. After compiling,
+it shapes only the runner's loopback with 60 ms delay, 10 ms jitter, 1% random packet loss
+and a 128 kbit/s rate limit, then runs the three delivery profiles sequentially:
+
+```sh
+sudo tc qdisc add dev lo root netem delay 60ms 10ms loss random 1% rate 128kbit
+trap 'tc -s qdisc show dev lo; nstat -az TcpRetransSegs; sudo tc qdisc del dev lo root' EXIT
+cargo test --locked delivery_ -- --ignored --nocapture --test-threads=1
+```
+
+These commands are for a disposable Linux test host, because they alter its loopback
+network. The job records kernel/mpv versions, startup and progress measurements, shaper drop
+statistics and TCP retransmission counters. An exit trap reports final counters and removes
+the shaper on success or failure. No real SoundCloud credentials or streams are used in CI.
+
 ## Remaining coverage
 
 Application-level delivery gaps are not packet loss: these tests do not exercise TCP
