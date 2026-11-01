@@ -96,7 +96,7 @@ fn config_dir() -> PathBuf {
         .join("scc")
 }
 
-fn cache_dir() -> PathBuf {
+pub fn cache_dir() -> PathBuf {
     let base = if cfg!(target_os = "macos") {
         None
     } else {
@@ -153,6 +153,9 @@ pub fn load_last() -> Option<Last> {
 }
 
 pub fn save_last(source: &str, track: &str, pos: f64) {
+    if cfg!(test) {
+        return; // tests must not touch the real resume file
+    }
     let l = Last {
         source: source.into(),
         track: track.into(),

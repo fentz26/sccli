@@ -63,6 +63,19 @@ In the queue, `PgUp`, `PgDn`, `g` and `G` jump through the list.
 
 The interface follows your system language. To keep a different one, change it in Settings.
 
+## When the connection drops
+
+scc watches playback and recovers by itself. It gets a fresh link and continues from where the
+song stopped, up to five times over about 30 seconds. If the network is still gone, it holds your
+place and shows that the connection was lost, so press `enter` to try again. A song that really
+cannot be played is skipped, and the reason stays on screen.
+
+## Troubleshooting
+
+`scc --debug` writes a log to `debug.log` in the cache folder, covering requests, retries,
+buffering and recovery. Tokens, signed links and private link codes are removed, so it is safe
+to attach to a bug report.
+
 ## Files
 
 ```text

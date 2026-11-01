@@ -2,13 +2,19 @@
 
 #[cfg(unix)]
 mod imp {
-    use std::{io, os::unix::net::UnixStream};
+    use std::{
+        io,
+        os::unix::net::UnixStream,
+        sync::atomic::{AtomicU32, Ordering},
+    };
 
     pub type Conn = UnixStream;
     pub type Reader = UnixStream;
 
     pub fn address() -> String {
-        let name = format!("scc-{}.sock", std::process::id());
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = format!("scc-{}-{n}.sock", std::process::id());
         std::env::temp_dir().join(name).display().to_string()
     }
 
@@ -32,6 +38,7 @@ mod imp {
         io::{self, Read},
         os::windows::io::AsRawHandle,
         ptr::null_mut,
+        sync::atomic::{AtomicU32, Ordering},
         thread,
         time::Duration,
     };
@@ -73,7 +80,9 @@ mod imp {
     }
 
     pub fn address() -> String {
-        format!(r"\\.\pipe\scc-{}", std::process::id())
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        format!(r"\\.\pipe\scc-{}-{n}", std::process::id())
     }
 
     pub fn connect(addr: &str) -> io::Result<Conn> {

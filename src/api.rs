@@ -1,28 +1,39 @@
 //! Direct SoundCloud API access. yt-dlp is only the fallback (see `ytdlp_*`): one API call
 //! takes about 0.2s, a yt-dlp run about 1.1s.
 
-use crate::config::{self, Quality};
-use anyhow::{Context, Result, bail};
+use crate::{
+    config::{self, Quality},
+    diag,
+    net::{self, ApiError, Cancel, Gate, Seen, Step},
+};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use ureq::ResponseExt;
-
+use serde_json::{Value, json};
 use std::{
-    io::{BufRead, BufReader},
-    process::{Command, Stdio},
+    io::{BufRead, BufReader, Read, Write},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use ureq::ResponseExt;
 
 const API: &str = "https://api-v2.soundcloud.com";
 const UA: &str = "Mozilla/5.0";
 const PAGE: usize = 200;
 const IDS_PER_CALL: usize = 50;
 const RELEASES: &str = "https://api.github.com/repos/fentz26/sccli/releases/latest";
+/// Finding the client id reads several script files; it must not hold up every other request.
+const SCRAPE_DEADLINE: Duration = Duration::from_secs(30);
+/// A stream lookup normally takes about a second.
+const YTDLP_STREAM_LIMIT: Duration = Duration::from_secs(45);
+/// A listing prints as it goes, so silence this long means it is stuck.
+const YTDLP_LIST_SILENCE: Duration = Duration::from_secs(90);
+const YTDLP_LIST_LIMIT: Duration = Duration::from_secs(900);
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Track {
@@ -49,16 +60,79 @@ pub struct Track {
     pub protected: bool,
 }
 
-pub enum StreamError {
-    Protected,
-    Other,
+pub struct Reply {
+    pub status: u16,
+    pub retry_after: Option<Duration>,
+    pub body: String,
+}
+
+pub enum Failure {
+    Timeout,
+    Network,
+}
+
+/// The HTTP layer, separate so every failure can be replayed in tests.
+pub trait Transport: Send + Sync {
+    fn get(&self, url: &str, oauth: Option<&str>) -> Result<Reply, Failure>;
+    /// Where a link ends up after redirects.
+    fn final_url(&self, url: &str) -> Option<String>;
+}
+
+struct Ureq(ureq::Agent);
+
+fn failure(e: ureq::Error) -> Failure {
+    match e {
+        ureq::Error::Timeout(_) => Failure::Timeout,
+        _ => Failure::Network,
+    }
+}
+
+impl Transport for Ureq {
+    fn get(&self, url: &str, oauth: Option<&str>) -> Result<Reply, Failure> {
+        let mut req = self.0.get(url).header("User-Agent", UA);
+        if let Some(t) = oauth {
+            req = req.header("Authorization", format!("OAuth {t}"));
+        }
+        let mut res = req.call().map_err(failure)?;
+        let retry_after = res
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok())
+            .map(Duration::from_secs);
+        Ok(Reply {
+            status: res.status().as_u16(),
+            retry_after,
+            body: res
+                .body_mut()
+                .with_config()
+                .limit(64 * 1024 * 1024)
+                .read_to_string()
+                .map_err(failure)?,
+        })
+    }
+
+    fn final_url(&self, url: &str) -> Option<String> {
+        let res = self.0.get(url).header("User-Agent", UA).call().ok()?;
+        Some(res.get_uri().to_string())
+    }
+}
+
+struct ClientId {
+    id: Option<String>,
+    generation: u64,
+    /// A request has succeeded with this id.
+    proven: bool,
+    refreshed: Option<Instant>,
 }
 
 pub struct Api {
-    agent: ureq::Agent,
+    http: Box<dyn Transport>,
     token: Option<String>,
-    client_id: Mutex<Option<String>>,
-    refreshed: AtomicBool,
+    client: Mutex<ClientId>,
+    gate: Gate,
+    save_client_id: bool,
+    sleep: Box<dyn Fn(Duration) + Send + Sync>,
 }
 
 fn clean(s: &str) -> String {
@@ -151,97 +225,223 @@ fn parse_track(v: &Value) -> Option<Track> {
 impl Api {
     pub fn new(token: Option<String>) -> Self {
         let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(20)))
+            .timeout_global(Some(net::ATTEMPT_TIMEOUT))
+            .http_status_as_error(false)
             .build()
             .into();
         Api {
-            agent,
+            http: Box::new(Ureq(agent)),
             token,
-            client_id: Mutex::new(config::load_client_id()),
-            refreshed: AtomicBool::new(false),
+            client: Mutex::new(ClientId {
+                id: config::load_client_id(),
+                generation: 0,
+                proven: false,
+                refreshed: None,
+            }),
+            gate: Gate::new(net::MAX_CONCURRENT),
+            save_client_id: true,
+            sleep: Box::new(thread::sleep),
         }
     }
 
-    fn text(&self, url: &str, auth: bool) -> Result<String, ureq::Error> {
-        let mut req = self.agent.get(url).header("User-Agent", UA);
-        if let (true, Some(t)) = (auth, &self.token) {
-            req = req.header("Authorization", format!("OAuth {t}"));
-        }
-        req.call()?
-            .body_mut()
-            .with_config()
-            .limit(64 * 1024 * 1024)
-            .read_to_string()
+    fn plain(&self, url: &str) -> Result<Reply, Failure> {
+        let _permit = self.gate.enter();
+        self.http.get(url, None)
     }
 
     /// SoundCloud's web client id is embedded in its JS bundles.
-    fn scrape_client_id(&self) -> Result<String> {
-        let home = self.text("https://soundcloud.com", false)?;
+    fn scrape_client_id(&self) -> Result<String, ApiError> {
+        let stop = Instant::now() + SCRAPE_DEADLINE;
+        let home = match self.plain("https://soundcloud.com") {
+            Ok(r) if r.status == 200 => r.body,
+            Ok(_) => return Err(ApiError::ClientId),
+            Err(Failure::Timeout) => return Err(ApiError::Timeout),
+            Err(Failure::Network) => return Err(ApiError::Network),
+        };
         let scripts = home
             .split('"')
             .filter(|s| s.starts_with("https://a-v2.sndcdn.com/assets/") && s.ends_with(".js"));
         for s in scripts.collect::<Vec<_>>().into_iter().rev() {
-            let Ok(js) = self.text(s, false) else { continue };
-            if let Some(i) = js.find("client_id:\"") {
-                let id: String = js[i + 11..].chars().take_while(|c| c.is_alphanumeric()).collect();
+            if Instant::now() >= stop {
+                break;
+            }
+            let Ok(js) = self.plain(s) else { continue };
+            if let Some(i) = js.body.find("client_id:\"") {
+                let id: String = js.body[i + 11..].chars().take_while(|c| c.is_alphanumeric()).collect();
                 if id.len() == 32 {
-                    config::save_client_id(&id);
+                    if self.save_client_id {
+                        config::save_client_id(&id);
+                    }
                     return Ok(id);
                 }
             }
         }
-        bail!("could not find a SoundCloud client_id")
+        Err(ApiError::ClientId)
     }
 
-    fn client_id(&self, force: bool) -> Result<String> {
-        let mut g = self.client_id.lock().unwrap();
-        if force || g.is_none() {
-            *g = Some(self.scrape_client_id()?);
+    /// (id, generation, proven). Callers arriving during a scrape wait for its result.
+    fn client_id(&self) -> Result<(String, u64, bool), ApiError> {
+        let mut c = self.client.lock().unwrap();
+        if c.id.is_none() {
+            c.id = Some(self.scrape_client_id()?);
+            c.generation += 1;
+            c.refreshed = Some(Instant::now());
         }
-        Ok(g.clone().unwrap())
+        Ok((c.id.clone().unwrap(), c.generation, c.proven))
     }
 
-    /// GET with the client id added. An expired client id is replaced once; busy or dropped
-    /// requests are retried, because one failed page would otherwise cut a long list short.
-    pub fn get(&self, url: &str) -> Result<Value> {
-        let mut last = None;
-        for _ in 0..3 {
-            let id = self.client_id(false)?;
+    /// Replaces a rejected id. Whoever arrives first scrapes; the rest find the new generation
+    /// and just retry. Returns false when no new id can be had right now.
+    fn refresh_client_id(&self, rejected: u64) -> bool {
+        let mut c = self.client.lock().unwrap();
+        if c.generation != rejected {
+            return true;
+        }
+        if c.refreshed.is_some_and(|t| t.elapsed() < net::CLIENT_ID_REFRESH_EVERY) {
+            return false;
+        }
+        c.refreshed = Some(Instant::now());
+        let Ok(id) = self.scrape_client_id() else { return false };
+        c.id = Some(id);
+        c.generation += 1;
+        c.proven = false;
+        diag::event("client_id_refreshed", json!({ "generation": c.generation }));
+        true
+    }
+
+    fn mark_proven(&self, generation: u64) {
+        let mut c = self.client.lock().unwrap();
+        if c.generation == generation {
+            c.proven = true;
+        }
+    }
+
+    fn wait(&self, how_long: Duration, cancel: &Cancel) -> Result<(), ApiError> {
+        let mut left = how_long;
+        while !left.is_zero() {
+            if cancel.is_stale() {
+                return Err(ApiError::Cancelled);
+            }
+            let step = left.min(Duration::from_millis(100));
+            (self.sleep)(step);
+            left -= step;
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, url: &str) -> Result<Value, ApiError> {
+        self.fetch(url, &Cancel::never())
+    }
+
+    /// GET with the client id added, within `net::REQUEST_DEADLINE` and `net::MAX_ATTEMPTS`.
+    fn fetch(&self, url: &str, cancel: &Cancel) -> Result<Value, ApiError> {
+        let deadline = Instant::now() + net::REQUEST_DEADLINE;
+        let mut may_refresh = true;
+        let mut last = ApiError::Network;
+        for attempt in 0..net::MAX_ATTEMPTS {
+            if cancel.is_stale() {
+                return Err(ApiError::Cancelled);
+            }
+            let (id, generation, id_proven) = self.client_id()?;
             let full = if url.contains("client_id=") {
                 url.to_string()
             } else {
                 format!("{url}{}client_id={id}", if url.contains('?') { '&' } else { '?' })
             };
-            match self.text(&full, true) {
-                Ok(s) => return Ok(serde_json::from_str(&s)?),
-                Err(ureq::Error::StatusCode(c @ (401 | 403))) => {
-                    if self.refreshed.swap(true, Ordering::Relaxed) {
-                        bail!("HTTP {c}");
+            let started = Instant::now();
+            let reply = {
+                let _permit = self.gate.enter();
+                self.http.get(&full, self.token.as_deref())
+            };
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let wait = match reply {
+                Ok(r) => {
+                    diag::event(
+                        "http",
+                        json!({ "url": url, "status": r.status, "latency_ms": latency_ms, "attempt": attempt }),
+                    );
+                    let seen = Seen {
+                        has_token: self.token.is_some(),
+                        id_proven,
+                        may_refresh,
+                    };
+                    let step = match net::next_step(r.status, r.retry_after, seen) {
+                        Step::RefreshClientId => {
+                            may_refresh = false;
+                            if self.refresh_client_id(generation) {
+                                continue;
+                            }
+                            net::next_step(
+                                r.status,
+                                r.retry_after,
+                                Seen {
+                                    may_refresh: false,
+                                    ..seen
+                                },
+                            )
+                        }
+                        step => step,
+                    };
+                    match step {
+                        Step::Done => {
+                            self.mark_proven(generation);
+                            return serde_json::from_str(&r.body).map_err(|_| ApiError::Invalid);
+                        }
+                        Step::Fail(e) => return Err(e),
+                        Step::Retry(after) => {
+                            last = if r.status == 429 {
+                                ApiError::RateLimited
+                            } else {
+                                ApiError::Server(r.status)
+                            };
+                            after
+                        }
+                        Step::RefreshClientId => None,
                     }
-                    self.client_id(true)?;
-                    last = Some(anyhow::anyhow!("HTTP {c}"));
                 }
-                Err(ureq::Error::StatusCode(c)) if c != 429 && c < 500 => bail!("HTTP {c}"),
-                Err(e) => {
-                    last = Some(e.into());
-                    thread::sleep(Duration::from_millis(400));
+                Err(f) => {
+                    last = match f {
+                        Failure::Timeout => ApiError::Timeout,
+                        Failure::Network => ApiError::Network,
+                    };
+                    diag::event(
+                        "http_failed",
+                        json!({ "url": url, "error": last.to_string(), "latency_ms": latency_ms, "attempt": attempt }),
+                    );
+                    None
                 }
+            };
+            if attempt + 1 == net::MAX_ATTEMPTS {
+                break;
             }
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(1, |d| d.subsec_nanos() as u64);
+            let wait = wait.unwrap_or_else(|| net::backoff(attempt, nanos));
+            if Instant::now() + wait >= deadline {
+                break;
+            }
+            diag::event(
+                "retry",
+                json!({ "url": url, "wait_ms": wait.as_millis() as u64, "attempt": attempt }),
+            );
+            self.wait(wait, cancel)?;
         }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("request failed")))
+        Err(last)
     }
 
     /// Latest published release, without the leading `v`. None: nothing is published yet.
     /// Goes to GitHub, so the SoundCloud token is never attached.
     pub fn latest_version(&self) -> Result<Option<String>> {
-        match self.text(RELEASES, false) {
-            Ok(s) => {
-                let v: Value = serde_json::from_str(&s)?;
+        let r = self.plain(RELEASES).map_err(|_| ApiError::Network)?;
+        match r.status {
+            404 => Ok(None),
+            200 => {
+                let v: Value = serde_json::from_str(&r.body)?;
                 let tag = v["tag_name"].as_str().context("no tag in release")?;
                 Ok(Some(tag.trim_start_matches('v').to_string()))
             }
-            Err(ureq::Error::StatusCode(404)) => Ok(None),
-            Err(e) => Err(e.into()),
+            c => Err(ApiError::Rejected(c).into()),
         }
     }
 
@@ -253,7 +453,7 @@ impl Api {
             .to_string())
     }
 
-    fn resolve(&self, url: &str) -> Result<Value> {
+    fn resolve(&self, url: &str) -> Result<Value, ApiError> {
         self.get(&format!("{API}/resolve?url={}", encode(url)))
     }
 
@@ -327,10 +527,7 @@ impl Api {
         if !source.contains("//on.soundcloud.com/") {
             return source.to_string();
         }
-        match self.agent.get(source).header("User-Agent", UA).call() {
-            Ok(r) => r.get_uri().to_string(),
-            Err(_) => source.to_string(),
-        }
+        self.http.final_url(source).unwrap_or_else(|| source.to_string())
     }
 
     /// Lists a source page by page. Ok(false): not something the API path handles, use yt-dlp.
@@ -387,7 +584,7 @@ impl Api {
         Ok(true)
     }
 
-    fn stream_of(&self, t: &Track, q: Quality) -> Result<Option<String>> {
+    fn stream_of(&self, t: &Track, q: Quality, cancel: &Cancel) -> Result<Option<String>, ApiError> {
         let pick = if q == Quality::Saver {
             t.low.as_ref().or(t.best.as_ref())
         } else {
@@ -401,64 +598,131 @@ impl Api {
                 ("secret_token", t.secret.as_deref()),
             ],
         );
-        Ok(self.get(&url)?["url"].as_str().map(str::to_string))
+        Ok(self.fetch(&url, cancel)?["url"].as_str().map(str::to_string))
     }
 
     /// The uploader's original file, which can be lossless. SoundCloud counts this as a download.
-    fn original(&self, t: &Track) -> Option<String> {
+    fn original(&self, t: &Track, cancel: &Cancel) -> Option<String> {
         if !t.downloadable || t.id == 0 {
             return None;
         }
         let url = format!("{API}/tracks/{}/download", t.id);
-        self.get(&with_query(&url, &[("secret_token", t.secret.as_deref())]))
+        self.fetch(&with_query(&url, &[("secret_token", t.secret.as_deref())]), cancel)
             .ok()?["redirectUri"]
             .as_str()
             .map(str::to_string)
     }
 
-    /// Direct playable URL. Stored track data can be stale, so failure re-reads the track once.
-    pub fn stream(&self, t: &Track, q: Quality) -> Result<String, StreamError> {
+    /// Direct playable URL. Stored track data can be stale, so a refusal re-reads the track once.
+    pub fn stream(&self, t: &Track, q: Quality, cancel: &Cancel) -> Result<String, ApiError> {
         if q == Quality::Original {
-            if let Some(u) = self.original(t) {
+            if let Some(u) = self.original(t, cancel) {
                 return Ok(u);
             }
         }
         if t.protected {
-            return Err(StreamError::Protected);
+            return Err(ApiError::Protected);
         }
-        if let Ok(Some(u)) = self.stream_of(t, q) {
-            return Ok(u);
+        match self.stream_of(t, q, cancel) {
+            Ok(Some(u)) => return Ok(u),
+            Err(e) if e.is_transient() || matches!(e, ApiError::Cancelled | ApiError::Auth) => return Err(e),
+            _ => {}
         }
         let fresh = if t.id != 0 {
             let url = format!("{API}/tracks/{}", t.id);
-            self.get(&with_query(&url, &[("secret_token", t.secret.as_deref())]))
+            self.fetch(&with_query(&url, &[("secret_token", t.secret.as_deref())]), cancel)?
         } else {
-            self.resolve(&t.url)
+            self.resolve(&t.url)?
         };
-        let fresh = fresh.map_err(|_| StreamError::Other)?;
-        let fresh = parse_track(&fresh).ok_or(StreamError::Other)?;
+        let fresh = parse_track(&fresh).ok_or(ApiError::Invalid)?;
         if fresh.protected {
-            return Err(StreamError::Protected);
+            return Err(ApiError::Protected);
         }
-        self.stream_of(&fresh, q).ok().flatten().ok_or(StreamError::Other)
+        self.stream_of(&fresh, q, cancel)?.ok_or(ApiError::ExpiredStream)
     }
 }
 
-fn auth_args(token: Option<&str>) -> Vec<String> {
-    token
-        .map(|t| vec!["--add-header".into(), format!("Authorization:OAuth {t}")])
-        .unwrap_or_default()
+/// Options for yt-dlp on stdin. On the command line a token is readable by every local user.
+fn ytdlp_options(token: Option<&str>) -> String {
+    match token {
+        Some(t) => {
+            let t: String = t.chars().filter(|c| !matches!(c, '"' | '\\' | '\n' | '\r')).collect();
+            format!("--add-header \"Authorization:OAuth {t}\"\n")
+        }
+        None => String::new(),
+    }
+}
+
+fn ytdlp(args: &[&str], token: Option<&str>) -> std::io::Result<Child> {
+    let mut cmd = Command::new("yt-dlp");
+    if token.is_some() {
+        cmd.args(["--config-locations", "-"]);
+    }
+    let mut child = cmd
+        .arg("--no-warnings")
+        .args(args)
+        .stdin(if token.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(ytdlp_options(token).as_bytes());
+    }
+    Ok(child)
+}
+
+/// yt-dlp's stderr without the prompt it prints when reading options from stdin.
+fn ytdlp_errors(stderr: &str) -> String {
+    let lines = stderr.lines().filter(|l| !l.starts_with("Reading options from STDIN"));
+    diag::redact(lines.collect::<Vec<_>>().join("\n").trim())
+}
+
+/// Waits for a program, killing it at `limit`. Output is read on the side so a full pipe
+/// cannot stall it, and a stuck reader cannot stall us.
+fn finish_within(mut child: Child, limit: Duration) -> Result<(ExitStatus, String, String), String> {
+    let (tx, rx) = mpsc::channel();
+    for (i, stream) in [
+        child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut s) = stream {
+                let _ = s.read_to_string(&mut text);
+            }
+            let _ = tx.send((i, text));
+        });
+    }
+    let stop = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < stop => thread::sleep(Duration::from_millis(25)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("yt-dlp did not finish within {}s", limit.as_secs()));
+            }
+        }
+    };
+    let (mut out, mut err) = (String::new(), String::new());
+    for _ in 0..2 {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok((0, text)) => out = text,
+            Ok((_, text)) => err = text,
+            Err(_) => break,
+        }
+    }
+    Ok((status, out, err))
 }
 
 /// Fallback listing for pages the API path does not cover. Returns yt-dlp's error text, if any.
 pub fn ytdlp_list(source: &str, token: Option<&str>, emit: &mut dyn FnMut(Vec<Track>)) -> Option<String> {
-    let child = Command::new("yt-dlp")
-        .args(["--flat-playlist", "--dump-json", "--no-warnings"])
-        .args(auth_args(token))
-        .arg(source)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+    let child = ytdlp(&["--flat-playlist", "--dump-json", source], token);
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
@@ -475,10 +739,30 @@ pub fn ytdlp_list(source: &str, token: Option<&str>, emit: &mut dyn FnMut(Vec<Tr
             s
         })
     });
-    for line in BufReader::new(child.stdout.take().unwrap())
-        .lines()
-        .map_while(Result::ok)
+    let stdout = child.stdout.take().unwrap();
+    let child = Arc::new(Mutex::new(child));
+    let started = Instant::now();
+    let heard = Arc::new(AtomicU64::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+    let stuck = Arc::new(AtomicBool::new(false));
     {
+        let (child, heard, finished, stuck) = (child.clone(), heard.clone(), finished.clone(), stuck.clone());
+        thread::spawn(move || {
+            while !finished.load(Ordering::Relaxed) {
+                let quiet = started
+                    .elapsed()
+                    .saturating_sub(Duration::from_secs(heard.load(Ordering::Relaxed)));
+                if quiet > YTDLP_LIST_SILENCE || started.elapsed() > YTDLP_LIST_LIMIT {
+                    stuck.store(true, Ordering::Relaxed);
+                    let _ = child.lock().unwrap().kill();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        });
+    }
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        heard.store(started.elapsed().as_secs(), Ordering::Relaxed);
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -509,26 +793,127 @@ pub fn ytdlp_list(source: &str, token: Option<&str>, emit: &mut dyn FnMut(Vec<Tr
             protected: false,
         }]);
     }
-    let _ = child.wait();
-    err.and_then(|h| h.join().ok()).filter(|s| !s.trim().is_empty())
+    finished.store(true, Ordering::Relaxed);
+    let _ = child.lock().unwrap().wait();
+    if stuck.load(Ordering::Relaxed) {
+        return Some("yt-dlp stopped responding".to_string());
+    }
+    err.and_then(|h| h.join().ok())
+        .map(|s| ytdlp_errors(&s))
+        .filter(|s| !s.is_empty())
 }
 
 /// Fallback stream lookup when the API path fails.
 pub fn ytdlp_stream(url: &str, token: Option<&str>) -> Result<String, String> {
-    let o = Command::new("yt-dlp")
-        .args(["-g", "-f", "bestaudio/best", "--no-warnings"])
-        .args(auth_args(token))
-        .arg(url)
-        .output()
-        .map_err(|e| e.to_string())?;
-    let out = String::from_utf8_lossy(&o.stdout);
+    let child = ytdlp(&["-g", "-f", "bestaudio/best", url], token).map_err(|e| e.to_string())?;
+    let (_, out, err) = finish_within(child, YTDLP_STREAM_LIMIT)?;
     match out.lines().next() {
         Some(l) if !l.is_empty() => Ok(l.to_string()),
-        _ => Err(String::from_utf8_lossy(&o.stderr)
-            .lines()
-            .last()
-            .unwrap_or("unplayable")
-            .to_string()),
+        _ => Err(ytdlp_errors(&err).lines().last().unwrap_or("unplayable").to_string()),
+    }
+}
+
+/// Scripted HTTP for tests: every failure the client handles can be replayed exactly.
+#[cfg(test)]
+pub mod mock {
+    use super::*;
+    use std::{collections::VecDeque, sync::atomic::AtomicUsize};
+
+    pub const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    pub const ID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    pub type Answer = Result<(u16, Option<u64>, String), Failure>;
+
+    #[derive(Default)]
+    pub struct Mock {
+        pub script: Mutex<VecDeque<Answer>>,
+        pub calls: Mutex<Vec<(String, Option<String>)>>,
+        pub scrapes: AtomicUsize,
+        /// Answers 401 to this client id, whatever the script says.
+        pub dead_id: Mutex<Option<String>>,
+    }
+
+    impl Transport for Arc<Mock> {
+        fn get(&self, url: &str, oauth: Option<&str>) -> Result<Reply, Failure> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((url.to_string(), oauth.map(str::to_string)));
+            if url == "https://soundcloud.com" {
+                self.scrapes.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(5));
+                let body = "\"https://a-v2.sndcdn.com/assets/1.js\"".to_string();
+                return Ok(Reply {
+                    status: 200,
+                    retry_after: None,
+                    body,
+                });
+            }
+            if url.ends_with(".js") {
+                let body = format!("client_id:\"{ID_B}\"");
+                return Ok(Reply {
+                    status: 200,
+                    retry_after: None,
+                    body,
+                });
+            }
+            let dead = self.dead_id.lock().unwrap().clone();
+            if dead.is_some_and(|d| url.contains(&d)) {
+                return Ok(Reply {
+                    status: 401,
+                    retry_after: None,
+                    body: String::new(),
+                });
+            }
+            match self.script.lock().unwrap().pop_front() {
+                Some(a) => a.map(|(status, after, body)| Reply {
+                    status,
+                    retry_after: after.map(Duration::from_secs),
+                    body,
+                }),
+                None => Ok(Reply {
+                    status: 200,
+                    retry_after: None,
+                    body: "{}".into(),
+                }),
+            }
+        }
+
+        fn final_url(&self, _url: &str) -> Option<String> {
+            None
+        }
+    }
+
+    pub fn ok(body: &str) -> Answer {
+        Ok((200, None, body.to_string()))
+    }
+
+    pub fn status(code: u16) -> Answer {
+        Ok((code, None, String::new()))
+    }
+
+    /// An API with client id A that records its waits instead of sleeping.
+    pub fn api(script: Vec<Answer>, token: Option<&str>) -> (Api, Arc<Mock>, Arc<Mutex<Duration>>) {
+        let mock = Arc::new(Mock {
+            script: Mutex::new(script.into()),
+            ..Default::default()
+        });
+        let slept = Arc::new(Mutex::new(Duration::ZERO));
+        let total = slept.clone();
+        let api = Api {
+            http: Box::new(mock.clone()),
+            token: token.map(str::to_string),
+            client: Mutex::new(ClientId {
+                id: Some(ID_A.to_string()),
+                generation: 0,
+                proven: false,
+                refreshed: None,
+            }),
+            gate: Gate::new(net::MAX_CONCURRENT),
+            save_client_id: false,
+            sleep: Box::new(move |d| *total.lock().unwrap() += d),
+        };
+        (api, mock, slept)
     }
 }
 
@@ -649,5 +1034,236 @@ mod tests {
     #[test]
     fn encodes_query_values() {
         assert_eq!(encode("a b/ç"), "a%20b%2F%C3%A7");
+    }
+
+    use super::mock::*;
+
+    fn calls(m: &Mock) -> usize {
+        m.calls.lock().unwrap().len()
+    }
+
+    #[test]
+    fn honours_retry_after() {
+        let (api, m, slept) = api(vec![Ok((429, Some(7), String::new())), ok("{}")], None);
+        assert!(api.get("https://x/a").is_ok());
+        assert_eq!(calls(&m), 2);
+        assert_eq!(*slept.lock().unwrap(), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn a_long_rate_limit_fails_visibly_at_once() {
+        let (api, m, slept) = api(vec![Ok((429, Some(3600), String::new()))], None);
+        assert_eq!(api.get("https://x/a").unwrap_err(), ApiError::RateLimited);
+        assert_eq!(calls(&m), 1);
+        assert_eq!(*slept.lock().unwrap(), Duration::ZERO);
+    }
+
+    #[test]
+    fn server_errors_stop_after_the_attempt_limit() {
+        let (api, m, slept) = api((0..20).map(|_| status(503)).collect(), None);
+        assert_eq!(api.get("https://x/a").unwrap_err(), ApiError::Server(503));
+        assert_eq!(calls(&m), net::MAX_ATTEMPTS as usize);
+        assert!(*slept.lock().unwrap() < net::REQUEST_DEADLINE);
+    }
+
+    #[test]
+    fn a_blip_recovers_on_its_own() {
+        let (api, _, _) = api(
+            vec![Err(Failure::Network), Err(Failure::Timeout), ok("{\"a\":1}")],
+            None,
+        );
+        assert_eq!(api.get("https://x/a").unwrap()["a"], 1);
+    }
+
+    #[test]
+    fn going_offline_reports_the_kind_of_failure() {
+        let script = (0..9).map(|_| Err(Failure::Timeout)).collect();
+        let (api, _, _) = api(script, None);
+        assert_eq!(api.get("https://x/a").unwrap_err(), ApiError::Timeout);
+    }
+
+    #[test]
+    fn a_stale_client_id_is_replaced_and_the_request_retried() {
+        let (api, m, _) = api(vec![ok("{\"a\":1}")], None);
+        *m.dead_id.lock().unwrap() = Some(ID_A.to_string());
+        assert_eq!(api.get("https://x/a").unwrap()["a"], 1);
+        assert_eq!(m.scrapes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_rejected_token_is_blamed_on_the_login_not_the_client_id() {
+        let (api, m, _) = api(vec![status(401), status(401), status(401)], Some("tok"));
+        assert_eq!(api.get("https://x/a").unwrap_err(), ApiError::Auth);
+        assert_eq!(
+            m.scrapes.load(Ordering::SeqCst),
+            1,
+            "one refresh is enough to rule it out"
+        );
+        assert!(api.get("https://x/b").unwrap_err().to_string().contains("scc login"));
+        assert_eq!(
+            m.scrapes.load(Ordering::SeqCst),
+            1,
+            "repeat failures must not scrape again"
+        );
+    }
+
+    #[test]
+    fn a_refusal_with_a_working_client_id_is_not_a_client_id_problem() {
+        let (api, m, _) = api(vec![ok("{}"), status(403)], None);
+        api.get("https://x/a").unwrap();
+        assert_eq!(api.get("https://x/private").unwrap_err(), ApiError::Forbidden);
+        assert_eq!(m.scrapes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn concurrent_failures_refresh_the_client_id_once() {
+        let (api, m, _) = api(vec![], None);
+        *m.dead_id.lock().unwrap() = Some(ID_A.to_string());
+        let api = Arc::new(api);
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let api = api.clone();
+                thread::spawn(move || api.get(&format!("https://x/{i}")).is_ok())
+            })
+            .collect();
+        assert!(threads.into_iter().all(|t| t.join().unwrap()));
+        assert_eq!(m.scrapes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn missing_content_is_not_retried() {
+        let (api, m, _) = api(vec![status(404)], None);
+        assert_eq!(api.get("https://x/a").unwrap_err(), ApiError::Unavailable);
+        assert_eq!(calls(&m), 1);
+    }
+
+    #[test]
+    fn garbage_is_reported_rather_than_parsed() {
+        let (api, _, _) = api(vec![ok("<html>")], None);
+        assert_eq!(api.get("https://x/a").unwrap_err(), ApiError::Invalid);
+    }
+
+    #[test]
+    fn cancelled_requests_stop_before_and_between_attempts() {
+        let epoch = Arc::new(AtomicU64::new(0));
+        let cancel = Cancel::tied_to(&epoch);
+        epoch.fetch_add(1, Ordering::Relaxed);
+        let (api, m, _) = api(vec![status(503)], None);
+        assert_eq!(api.fetch("https://x/a", &cancel).unwrap_err(), ApiError::Cancelled);
+        assert_eq!(calls(&m), 0);
+    }
+
+    #[test]
+    fn the_token_only_goes_in_the_header_and_only_to_soundcloud_calls() {
+        let (api, m, _) = api(vec![status(404)], Some("sekret"));
+        *m.dead_id.lock().unwrap() = Some(ID_A.to_string());
+        let _ = api.get("https://x/a");
+        let _ = api.latest_version();
+        for (url, oauth) in m.calls.lock().unwrap().iter() {
+            assert!(!url.contains("sekret"), "{url}");
+            let public = url.contains("github.com") || !url.starts_with("https://x/");
+            assert_eq!(oauth.is_some(), !public, "{url}");
+        }
+    }
+
+    fn stream_track() -> Track {
+        parse_track(&track(vec![transcoding("aac_160k", "hls", "https://x/media")])).unwrap()
+    }
+
+    #[test]
+    fn stream_links_carry_the_secret_of_private_tracks() {
+        let (api, m, _) = api(vec![ok("{\"url\":\"https://cdn/s\"}")], None);
+        let mut t = stream_track();
+        t.secret = Some("s-abc".into());
+        assert_eq!(
+            api.stream(&t, Quality::Best, &Cancel::never()).unwrap(),
+            "https://cdn/s"
+        );
+        assert!(m.calls.lock().unwrap()[0].0.contains("secret_token=s-abc"));
+    }
+
+    #[test]
+    fn an_expired_stream_authorization_rereads_the_track() {
+        let fresh = track(vec![transcoding("aac_160k", "hls", "https://x/fresh")]).to_string();
+        let script = vec![ok("{}"), status(403), ok(&fresh), ok("{\"url\":\"https://cdn/new\"}")];
+        let (api, _, _) = api(script, None);
+        let _ = api.get("https://x/prove-the-client-id");
+        assert_eq!(
+            api.stream(&stream_track(), Quality::Best, &Cancel::never()).unwrap(),
+            "https://cdn/new"
+        );
+    }
+
+    #[test]
+    fn a_connection_problem_during_stream_lookup_stays_transient() {
+        let script = (0..9).map(|_| Err(Failure::Network)).collect();
+        let (api, m, _) = api(script, None);
+        let e = api
+            .stream(&stream_track(), Quality::Best, &Cancel::never())
+            .unwrap_err();
+        assert_eq!(e, ApiError::Network);
+        assert_eq!(
+            calls(&m),
+            net::MAX_ATTEMPTS as usize,
+            "no second round through the re-read"
+        );
+    }
+
+    #[test]
+    fn protected_tracks_make_no_requests() {
+        let (api, m, _) = api(vec![], None);
+        let mut t = stream_track();
+        t.protected = true;
+        assert_eq!(
+            api.stream(&t, Quality::Best, &Cancel::never()).unwrap_err(),
+            ApiError::Protected
+        );
+        assert_eq!(calls(&m), 0);
+    }
+
+    #[test]
+    fn the_token_never_reaches_the_yt_dlp_command_line() {
+        assert_eq!(ytdlp_options(None), "");
+        assert_eq!(
+            ytdlp_options(Some("2-ab\"c\n")),
+            "--add-header \"Authorization:OAuth 2-abc\"\n"
+        );
+    }
+
+    #[test]
+    fn the_stdin_prompt_is_not_an_error() {
+        assert_eq!(ytdlp_errors("Reading options from STDIN - EOF (Ctrl+D) to end:\n"), "");
+        assert_eq!(
+            ytdlp_errors("Reading options from STDIN\nERROR: https://x/a?client_id=1 failed"),
+            "ERROR: https://x/a?<redacted> failed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_program_is_killed_at_its_limit() {
+        let child = Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let t0 = Instant::now();
+        assert!(finish_within(child, Duration::from_millis(150)).is_err());
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_noisy_program_cannot_fill_its_pipe_and_hang() {
+        let child = Command::new("sh")
+            .args(["-c", "head -c 2000000 /dev/zero | tr '\\0' x; echo oops >&2"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (_, out, err) = finish_within(child, Duration::from_secs(20)).unwrap();
+        assert_eq!(out.len(), 2_000_000);
+        assert_eq!(err.trim(), "oops");
     }
 }

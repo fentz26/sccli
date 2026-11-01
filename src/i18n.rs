@@ -87,9 +87,15 @@ pub enum K {
     UpToDate,
     UpdateAvailable,
     UpdateFailed,
+    Buffering,
+    Stalled,
+    Recovering,
+    ConnectionLost,
+    Reconnecting,
+    ListIncomplete,
 }
 
-const TABLE: [[&str; 6]; 48] = [
+const TABLE: [[&str; 6]; 54] = [
     // Help
     [
         "space pause/resume · n next · b prev · s stop · ←/→ seek · ↑/↓ volume · l list · , settings · q quit",
@@ -383,6 +389,48 @@ const TABLE: [[&str; 6]; 48] = [
         "업데이트를 확인할 수 없습니다",
         "No se pudo buscar actualizaciones",
     ],
+    // Playback states
+    [
+        "Buffering",
+        "Mise en mémoire tampon",
+        "缓冲中",
+        "バッファリング中",
+        "버퍼링 중",
+        "Almacenando en búfer",
+    ],
+    ["Stalled", "Bloqué", "已停滞", "停止中", "멈춤", "Detenido"],
+    [
+        "Reconnecting",
+        "Reconnexion",
+        "正在重新连接",
+        "再接続中",
+        "다시 연결 중",
+        "Reconectando",
+    ],
+    [
+        "Connection lost, press enter to retry",
+        "Connexion perdue, appuyez sur entrée pour réessayer",
+        "连接已断开，按回车重试",
+        "接続が切れました。Enter で再試行",
+        "연결이 끊겼습니다. Enter로 다시 시도",
+        "Conexión perdida, pulsa intro para reintentar",
+    ],
+    [
+        "reconnecting {n}/{max}",
+        "reconnexion {n}/{max}",
+        "正在重新连接 {n}/{max}",
+        "再接続中 {n}/{max}",
+        "다시 연결 중 {n}/{max}",
+        "reconectando {n}/{max}",
+    ],
+    [
+        "list incomplete: {e}",
+        "liste incomplète : {e}",
+        "列表不完整：{e}",
+        "リストが不完全です: {e}",
+        "목록이 불완전합니다: {e}",
+        "lista incompleta: {e}",
+    ],
 ];
 
 pub fn tr(k: K) -> &'static str {
@@ -454,6 +502,9 @@ mod tests {
             (K::SignedIn, "{user}"),
             (K::Skipped, "{e}"),
             (K::UpdateAvailable, "{v}"),
+            (K::Reconnecting, "{n}"),
+            (K::Reconnecting, "{max}"),
+            (K::ListIncomplete, "{e}"),
         ] {
             assert!(TABLE[row as usize].iter().all(|s| s.contains(key)), "{key}");
         }
