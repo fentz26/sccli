@@ -131,6 +131,46 @@ pub fn backoff(attempt: u32, seed: u64) -> Duration {
     Duration::from_millis(ceiling / 2 + x % (ceiling / 2 + 1))
 }
 
+/// Retry-After accepts either delay-seconds or an IMF-fixdate in GMT.
+pub fn retry_after(value: &str, now: std::time::SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return value.parse().ok().map(Duration::from_secs);
+    }
+    let fields: Vec<_> = value.split_whitespace().collect();
+    if fields.len() != 6
+        || fields[5] != "GMT"
+        || !matches!(fields[0], "Mon," | "Tue," | "Wed," | "Thu," | "Fri," | "Sat," | "Sun,")
+    {
+        return None;
+    }
+    let day: i64 = fields[1].parse().ok()?;
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|m| *m == fields[2])?
+        + 1;
+    let year: i64 = fields[3].parse().ok()?;
+    if !(1970..=9999).contains(&year) {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if day < 1 || day > days[month - 1] {
+        return None;
+    }
+    let time: Vec<u64> = fields[4].split(':').map(str::parse).collect::<Result<_, _>>().ok()?;
+    if time.len() != 3 || time[0] > 23 || time[1] > 59 || time[2] > 59 {
+        return None;
+    }
+    let before = |y: i64| 365 * y + y / 4 - y / 100 + y / 400;
+    let elapsed_days = before(year - 1) - before(1969) + days[..month - 1].iter().sum::<i64>() + day - 1;
+    let seconds = elapsed_days as u64 * 86400 + time[0] * 3600 + time[1] * 60 + time[2];
+    let date = std::time::UNIX_EPOCH.checked_add(Duration::from_secs(seconds))?;
+    Some(date.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
 /// Check cancellation and the shared deadline before starting another blocking operation.
 pub fn remaining(deadline: Instant, cancel: &Cancel) -> Result<Duration, ApiError> {
     if cancel.is_stale() {
@@ -205,6 +245,33 @@ impl Cancel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_accepts_dates_and_rejects_invalid_values() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(784111777);
+        assert_eq!(retry_after("Sun, 06 Nov 1994 08:49:37 GMT", now), Some(Duration::ZERO));
+        assert_eq!(
+            retry_after("Sun, 06 Nov 1994 08:49:57 GMT", now),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(
+            retry_after("Sun, 06 Nov 1994 08:50:08 GMT", now),
+            Some(Duration::from_secs(31))
+        );
+        assert_eq!(retry_after("20", now), Some(Duration::from_secs(20)));
+        assert_eq!(retry_after("Sun, 31 Feb 1994 08:49:37 GMT", now), None);
+        assert_eq!(retry_after("Sun, 06 Nov 1994 25:49:37 GMT", now), None);
+        assert_eq!(
+            next_step(429, retry_after("Sun, 06 Nov 1994 08:50:08 GMT", now), NEW),
+            Step::Fail(ApiError::RateLimited)
+        );
+        assert_eq!(
+            retry_after("Thu, 29 Feb 2024 00:00:00 GMT", std::time::UNIX_EPOCH),
+            Some(Duration::from_secs(1709164800))
+        );
+        assert_eq!(retry_after("Thu, 29 Feb 2023 00:00:00 GMT", now), None);
+        assert_eq!(retry_after("garbage", now), None);
+    }
 
     const NEW: Seen = Seen {
         has_token: false,

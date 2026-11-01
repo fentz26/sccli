@@ -77,7 +77,7 @@ pub enum Failure {
 pub trait Transport: Send + Sync {
     fn get(&self, url: &str, oauth: Option<&str>, timeout: Duration) -> Result<Reply, Failure>;
     /// Where a link ends up after redirects.
-    fn final_url(&self, url: &str) -> Option<String>;
+    fn final_url(&self, url: &str, timeout: Duration) -> Option<String>;
 }
 
 struct Ureq(ureq::Agent);
@@ -106,8 +106,7 @@ impl Transport for Ureq {
             .headers()
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse().ok())
-            .map(Duration::from_secs);
+            .and_then(|v| net::retry_after(v, SystemTime::now()));
         Ok(Reply {
             status: res.status().as_u16(),
             retry_after,
@@ -120,8 +119,16 @@ impl Transport for Ureq {
         })
     }
 
-    fn final_url(&self, url: &str) -> Option<String> {
-        let res = self.0.get(url).header("User-Agent", UA).call().ok()?;
+    fn final_url(&self, url: &str, timeout: Duration) -> Option<String> {
+        let res = self
+            .0
+            .get(url)
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
+            .header("User-Agent", UA)
+            .call()
+            .ok()?;
         Some(res.get_uri().to_string())
     }
 }
@@ -598,7 +605,17 @@ impl Api {
         if !source.contains("//on.soundcloud.com/") {
             return source.to_string();
         }
-        self.http.final_url(source).unwrap_or_else(|| source.to_string())
+        self.expand_until(source, Instant::now() + net::REQUEST_DEADLINE, &Cancel::never())
+            .unwrap_or_else(|_| source.to_string())
+    }
+
+    fn expand_until(&self, source: &str, deadline: Instant, cancel: &Cancel) -> Result<String, ApiError> {
+        let _permit = self.gate.enter(deadline, cancel)?;
+        let timeout = net::remaining(deadline, cancel)?.min(net::ATTEMPT_TIMEOUT);
+        Ok(self
+            .http
+            .final_url(source, timeout)
+            .unwrap_or_else(|| source.to_string()))
     }
 
     /// Lists a source page by page. Ok(false): not something the API path handles, use yt-dlp.
@@ -851,7 +868,19 @@ fn list_child(
             }
         });
     }
+    let mut exited_at = None;
+    let mut exit_status = None;
     while !stuck.load(Ordering::Relaxed) {
+        if exited_at.is_none() {
+            if let Ok(Some(status)) = child.lock().unwrap().try_wait() {
+                exit_status = Some(status);
+                exited_at = Some(Instant::now());
+                finished.store(true, Ordering::Relaxed);
+            }
+        }
+        if exited_at.is_some_and(|t: Instant| t.elapsed() >= Duration::from_secs(1)) {
+            break;
+        }
         let line = match line_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(line) => line,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -893,7 +922,12 @@ fn list_child(
     loop {
         let status = child.lock().unwrap().try_wait();
         match status {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                exited_at.get_or_insert_with(Instant::now);
+                finished.store(true, Ordering::Relaxed);
+                break;
+            }
             Ok(None) => thread::sleep(Duration::from_millis(25)),
             Err(_) => {
                 let mut child = child.lock().unwrap();
@@ -906,20 +940,25 @@ fn list_child(
     // A descendant can keep either pipe open after yt-dlp exits.
     let mut error = None;
     while !stuck.load(Ordering::Relaxed) {
-        match err_rx.recv_timeout(Duration::from_millis(50)) {
+        let left = Duration::from_secs(1).saturating_sub(exited_at.map_or(Duration::ZERO, |t| t.elapsed()));
+        match err_rx.recv_timeout(left.min(Duration::from_millis(50))) {
             Ok(text) => {
                 error = Some(ytdlp_errors(&text)).filter(|s| !s.is_empty());
                 break;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) if !left.is_zero() => continue,
+            Err(_) => break,
         }
     }
     finished.store(true, Ordering::Relaxed);
     if stuck.load(Ordering::Relaxed) {
         return Some("yt-dlp stopped responding".to_string());
     }
-    error
+    error.or_else(|| {
+        exit_status
+            .filter(|s| !s.success())
+            .map(|s| format!("yt-dlp exited with {s}"))
+    })
 }
 
 /// Fallback stream lookup when the API path fails.
@@ -998,7 +1037,7 @@ pub mod mock {
             }
         }
 
-        fn final_url(&self, _url: &str) -> Option<String> {
+        fn final_url(&self, _url: &str, _timeout: Duration) -> Option<String> {
             None
         }
     }
@@ -1043,6 +1082,59 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn short_links_pass_the_remaining_budget_to_the_transport() {
+        struct Redirect(Mutex<Option<Duration>>);
+        impl Transport for Arc<Redirect> {
+            fn get(&self, _: &str, _: Option<&str>, _: Duration) -> Result<Reply, Failure> {
+                panic!("short links must not attach OAuth or read a response body")
+            }
+            fn final_url(&self, _: &str, timeout: Duration) -> Option<String> {
+                *self.0.lock().unwrap() = Some(timeout);
+                Some("https://soundcloud.com/a/song".into())
+            }
+        }
+        let (mut api, _, _) = mock::api(vec![], Some("secret"));
+        let redirect = Arc::new(Redirect(Mutex::new(None)));
+        api.http = Box::new(redirect.clone());
+        let result = api.expand_until(
+            "https://on.soundcloud.com/a",
+            Instant::now() + Duration::from_secs(1),
+            &Cancel::never(),
+        );
+        assert_eq!(result.unwrap(), "https://soundcloud.com/a/song");
+        assert!(redirect.0.lock().unwrap().unwrap() <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn short_link_lookup_obeys_queue_deadline_and_cancellation() {
+        let (mut api, _, _) = mock::api(vec![], None);
+        api.gate = Gate::new(1);
+        let _permit = api
+            .gate
+            .enter(Instant::now() + net::REQUEST_DEADLINE, &Cancel::never())
+            .unwrap();
+        assert_eq!(
+            api.expand_until(
+                "https://on.soundcloud.com/a",
+                Instant::now() + Duration::from_millis(50),
+                &Cancel::never()
+            ),
+            Err(ApiError::Timeout)
+        );
+        let epoch = Arc::new(AtomicU64::new(0));
+        let cancel = Cancel::tied_to(&epoch);
+        epoch.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            api.expand_until(
+                "https://on.soundcloud.com/a",
+                Instant::now() + net::REQUEST_DEADLINE,
+                &cancel
+            ),
+            Err(ApiError::Cancelled)
+        );
+    }
+
+    #[test]
     fn a_timed_out_bundle_does_not_hide_a_later_client_id() {
         struct Bundles;
         impl Transport for Bundles {
@@ -1062,7 +1154,7 @@ mod tests {
                     body,
                 })
             }
-            fn final_url(&self, _: &str) -> Option<String> {
+            fn final_url(&self, _: &str, _: Duration) -> Option<String> {
                 None
             }
         }
@@ -1383,7 +1475,7 @@ mod tests {
                 }
                 reply
             }
-            fn final_url(&self, _: &str) -> Option<String> {
+            fn final_url(&self, _: &str, _: Duration) -> Option<String> {
                 None
             }
         }
@@ -1417,7 +1509,7 @@ mod tests {
                 }
                 self.0.get(url, oauth, timeout)
             }
-            fn final_url(&self, _: &str) -> Option<String> {
+            fn final_url(&self, _: &str, _: Duration) -> Option<String> {
                 None
             }
         }
@@ -1582,6 +1674,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_clean_listing_completes_when_a_descendant_holds_a_pipe() {
+        for script in [
+            r#"echo '{"url":"https://soundcloud.com/a/song","title":"Song"}'; sleep 4 & exit 0"#,
+            r#"echo '{"url":"https://soundcloud.com/a/song","title":"Song"}'; exec 1>&-; sleep 4 & exit 0"#,
+        ] {
+            let child = Command::new("sh")
+                .args(["-c", script])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut tracks = Vec::new();
+            let started = Instant::now();
+            let error = list_child(
+                child,
+                &mut |page| tracks.extend(page),
+                Duration::from_secs(3),
+                Duration::from_secs(10),
+            );
+            assert_eq!(error, None);
+            assert_eq!(tracks.len(), 1);
+            assert!(started.elapsed() < Duration::from_secs(3));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn listing_timeout_still_applies_after_stdout_closes() {
         let child = Command::new("sh")
             .args(["-c", "exec 1>&-; exec sleep 30"])
@@ -1599,7 +1718,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn listing_timeout_does_not_wait_for_grandchild_pipes() {
-        for script in ["sleep 4 & exec sleep 30", "exec 1>&-; sleep 4 & exit 0"] {
+        for script in ["sleep 4 & exec sleep 30", "exec 1>&-; sleep 4 & exec sleep 30"] {
             let child = Command::new("sh")
                 .args(["-c", script])
                 .stdout(Stdio::piped())
@@ -1719,7 +1838,7 @@ mod tests {
             self.inner.get(url, oauth, timeout)
         }
 
-        fn final_url(&self, _: &str) -> Option<String> {
+        fn final_url(&self, _: &str, _: Duration) -> Option<String> {
             None
         }
     }
@@ -1772,7 +1891,7 @@ mod tests {
                     body: String::new(),
                 })
             }
-            fn final_url(&self, _: &str) -> Option<String> {
+            fn final_url(&self, _: &str, _: Duration) -> Option<String> {
                 None
             }
         }
