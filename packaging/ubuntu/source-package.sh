@@ -13,6 +13,9 @@ case "$series" in
     *) echo "unknown series: $series" >&2; exit 1 ;;
 esac
 
+# Ubuntu's default cargo is too old on some series; use the versioned one when it is installed.
+PATH="/usr/lib/rust-$rust/bin:$PATH"
+
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 upstream=$(sed -n '1s/^sccli (\(.*\)-1).*/\1/p' debian/changelog)

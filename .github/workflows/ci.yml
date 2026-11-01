@@ -87,17 +87,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { series: jammy, image: "22.04" }
-          - { series: noble, image: "24.04" }
-          - { series: resolute, image: "26.04" }
-          - { series: stonking, image: "26.10" }
+          - { series: jammy, image: "22.04", rust: "1.91" }
+          - { series: noble, image: "24.04", rust: "1.91" }
+          - { series: resolute, image: "26.04", rust: "1.91" }
+          - { series: stonking, image: "26.10", rust: "1.97" }
     env:
       SERIES: ${{ matrix.series }}
+      RUST: ${{ matrix.rust }}
     steps:
       - name: Install packaging tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential ca-certificates cargo debhelper dpkg-dev git
+          apt-get install -y --no-install-recommends build-essential ca-certificates "cargo-$RUST" debhelper dpkg-dev git
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
