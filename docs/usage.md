@@ -77,8 +77,9 @@ A song SoundCloud says you cannot play, such as a removed or DRM protected one, 
 note that stays visible for 30 seconds, unless another notice replaces it.
 
 When you choose a different song, queued requests and retry waits are cancelled. Active
-HTTP reads and writes for the old song are interrupted too; DNS lookup and an initial TCP
-connection still rely on the request timeout. Cancellable lookups use a private connection
+HTTP response waits and reads for the old song are interrupted too. On Windows these
+reads check cancellation between short waits. DNS lookup, an initial TCP connection and
+blocked writes still rely on the request timeout. Cancellable lookups use a private connection
 pool so stopping one cannot interrupt the next song or a playlist request.
 
 ## Troubleshooting

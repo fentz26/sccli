@@ -5,7 +5,7 @@ use crate::{
     config::{self, Quality},
     log,
 };
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod cancel_io;
 mod process;
 pub mod requests;
@@ -105,19 +105,16 @@ impl Ureq {
         }
         // Agent clones share shutdown state. A fresh agent isolates this lookup
         // from API listings and from stream requests for the newly selected song.
+        #[cfg(not(windows))]
         let agent: ureq::Agent = self.0.config().clone().into();
         #[cfg(windows)]
-        let cancel_io = cancel_io::CancelIo::current();
+        let agent = cancel_io::agent(self.0.config().clone(), cancel.clone());
         thread::scope(|scope| {
             let (done, wait) = mpsc::channel::<()>();
             let mut active = Some(agent.clone());
             scope.spawn(move || {
                 loop {
                     if cancel.is_stale() {
-                        #[cfg(windows)]
-                        if let Some(cancel_io) = &cancel_io {
-                            cancel_io.cancel();
-                        }
                         if let Some(active) = active.take() {
                             active.shutdown();
                         }
@@ -1156,7 +1153,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn accept_test_connection(listener: &std::net::TcpListener) -> std::net::TcpStream {
+    pub(super) fn accept_test_connection(listener: &std::net::TcpListener) -> std::net::TcpStream {
         listener.set_nonblocking(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

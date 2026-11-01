@@ -222,7 +222,7 @@ impl Drop for Permit<'_> {
 }
 
 /// Ties queued, retrying and active requests to the song they were requested for.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Cancel(Option<(Arc<AtomicU64>, u64)>);
 
 impl Cancel {
