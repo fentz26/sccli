@@ -43,9 +43,9 @@ impl Mpv {
                 "--audio-display=no",
                 "--ytdl=no", // scc hands mpv direct URLs
                 // Skipping mpv's scripts cut first sound from about 1.0s to 0.65s.
+                // Only options old mpv versions know: an unknown option stops mpv from starting.
                 "--load-scripts=no",
                 "--load-stats-overlay=no",
-                "--load-console=no",
                 "--load-auto-profiles=no",
                 "--cache=yes",
             ])

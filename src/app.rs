@@ -864,6 +864,7 @@ pub fn run(source: String, cfg: Config, looping: bool, shuffle_on: bool, resume:
         app.go(0);
     }
 
+    let mut mpv_died = false;
     while !app.quit {
         let wait = if app.hover.is_some() {
             HOVER_DELAY
@@ -881,7 +882,8 @@ pub fn run(source: String, cfg: Config, looping: bool, shuffle_on: bool, resume:
         }
         app.tick();
         app.render()?;
-        if app.mpv.exited() {
+        if !app.quit && app.mpv.exited() {
+            mpv_died = true;
             break;
         }
     }
@@ -895,6 +897,9 @@ pub fn run(source: String, cfg: Config, looping: bool, shuffle_on: bool, resume:
     print!("\x1b[23;0t"); // restore the saved title where the terminal supports it
     let _ = stdout().flush();
     drop(raw);
+    if mpv_died {
+        bail!("mpv stopped unexpectedly; try updating mpv");
+    }
     if app.tracks.is_empty() && !app.note.is_empty() {
         bail!("{}", app.note);
     }
