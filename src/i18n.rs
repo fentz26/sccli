@@ -81,8 +81,7 @@ pub enum K {
     Normal,
     High,
     Protected,
-    TabAbout,
-    AboutHint,
+    About,
     CheckUpdates,
     Checking,
     UpToDate,
@@ -90,7 +89,7 @@ pub enum K {
     UpdateFailed,
 }
 
-const TABLE: [[&str; 6]; 49] = [
+const TABLE: [[&str; 6]; 48] = [
     // Help
     [
         "space pause/resume · n next · b prev · s stop · ←/→ seek · ↑/↓ volume · l list · , settings · q quit",
@@ -234,11 +233,11 @@ const TABLE: [[&str; 6]; 49] = [
     ["Queue", "File d'attente", "播放队列", "キュー", "재생목록", "Cola"],
     ["Settings", "Réglages", "设置", "設定", "설정", "Ajustes"],
     [
-        "↑/↓ move · ←/→ change · space pause · tab about · l/esc back",
-        "↑/↓ déplacer · ←/→ modifier · espace pause · tab à propos · l/échap retour",
-        "↑/↓ 移动 · ←/→ 更改 · 空格 暂停 · tab 关于 · l/esc 返回",
-        "↑/↓ 移動 · ←/→ 変更 · スペース 一時停止 · Tab 情報 · l/Esc 戻る",
-        "↑/↓ 이동 · ←/→ 변경 · 스페이스 일시정지 · Tab 정보 · l/Esc 뒤로",
+        "↑/↓ move · ←/→ change · space pause · tab queue · l/esc back",
+        "↑/↓ déplacer · ←/→ modifier · espace pause · tab file · l/échap retour",
+        "↑/↓ 移动 · ←/→ 更改 · 空格 暂停 · tab 队列 · l/esc 返回",
+        "↑/↓ 移動 · ←/→ 変更 · スペース 一時停止 · Tab キュー · l/Esc 戻る",
+        "↑/↓ 이동 · ←/→ 변경 · 스페이스 일시정지 · Tab 재생목록 · l/Esc 뒤로",
         "↑/↓ mover · ←/→ cambiar · espacio pausa · tab cola · l/esc volver",
     ],
     // Setting names
@@ -342,16 +341,8 @@ const TABLE: [[&str; 6]; 49] = [
         "보호된 스트림, 건너뜀",
         "transmisión protegida, omitida",
     ],
-    // About tab
+    // About section of Settings
     ["About", "À propos", "关于", "情報", "정보", "Acerca de"],
-    [
-        "enter check · space pause · tab queue · l/esc back",
-        "entrée vérifier · espace pause · tab file · l/échap retour",
-        "回车 检查 · 空格 暂停 · tab 队列 · l/esc 返回",
-        "Enter 確認 · スペース 一時停止 · Tab キュー · l/Esc 戻る",
-        "Enter 확인 · 스페이스 일시정지 · Tab 재생목록 · l/Esc 뒤로",
-        "intro comprobar · espacio pausa · tab cola · l/esc volver",
-    ],
     [
         "Check for updates",
         "Rechercher des mises à jour",

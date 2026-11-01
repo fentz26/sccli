@@ -1,4 +1,4 @@
-//! The player: event loop, playback queue, and the Queue, Settings and About tabs.
+//! The player: event loop, playback queue, and the Queue and Settings tabs.
 
 use crate::{
     api::{self, Api, StreamError, Track},
@@ -142,7 +142,6 @@ enum View {
     Player,
     Queue,
     Settings,
-    About,
 }
 
 struct App {
@@ -469,28 +468,21 @@ impl App {
     fn settings_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         match code {
             KeyCode::Char('l') | KeyCode::Char('q') | KeyCode::Char(',') | KeyCode::Esc => self.set_view(View::Player),
-            KeyCode::Tab => self.set_view(View::About),
+            KeyCode::Tab => self.set_view(View::Queue),
             KeyCode::Up | KeyCode::Char('k') => self.set_sel = self.set_sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.set_sel = (self.set_sel + 1).min(SETTINGS - 1),
+            KeyCode::Down | KeyCode::Char('j') => self.set_sel = (self.set_sel + 1).min(SETTINGS),
+            KeyCode::Enter if self.set_sel == SETTINGS => self.check_for_updates(),
+            KeyCode::Right | KeyCode::Left if self.set_sel == SETTINGS => {}
             KeyCode::Right | KeyCode::Enter => self.change(1),
             KeyCode::Left => self.change(-1),
             _ => self.play_key(code, mods),
         }
     }
 
-    fn about_key(&mut self, code: KeyCode, mods: KeyModifiers) {
-        match code {
-            KeyCode::Char('l') | KeyCode::Char('q') | KeyCode::Esc => self.set_view(View::Player),
-            KeyCode::Char(',') => self.set_view(View::Settings),
-            KeyCode::Tab => self.set_view(View::Queue),
-            KeyCode::Enter => {
-                if !matches!(self.update, UpdateCheck::Running) {
-                    self.update = UpdateCheck::Running;
-                    self.dirty = true;
-                    spawn_update_check(self.api.clone(), self.tx.clone());
-                }
-            }
-            _ => self.play_key(code, mods),
+    fn check_for_updates(&mut self) {
+        if !matches!(self.update, UpdateCheck::Running) {
+            self.update = UpdateCheck::Running;
+            spawn_update_check(self.api.clone(), self.tx.clone());
         }
     }
 
@@ -498,7 +490,6 @@ impl App {
         match self.view {
             View::Queue => self.queue_key(code, mods),
             View::Settings => self.settings_key(code, mods),
-            View::About => self.about_key(code, mods),
             View::Player => self.play_key(code, mods),
         }
     }
@@ -716,10 +707,9 @@ impl App {
             }
         };
         format!(
-            "{} {} {}",
+            "{} {}",
             tab(K::TabQueue, self.view == View::Queue),
-            tab(K::TabSettings, self.view == View::Settings),
-            tab(K::TabAbout, self.view == View::About)
+            tab(K::TabSettings, self.view == View::Settings)
         )
     }
 
@@ -751,24 +741,24 @@ impl App {
             let row = clip(&format!("   {name}{pad}   ‹ {value} ›"), w);
             out.push(if i == self.set_sel { reverse(&row) } else { row });
         }
-    }
-
-    fn about_rows(&self, w: usize, out: &mut Vec<String>) {
-        out.push(clip(tr(K::AboutHint), w));
-        out.push(format!("   scc {}", crate::VERSION));
-        out.push("   © 2026 Fentz · MIT License".to_string());
-        out.push(clip("   https://github.com/fentz26/sccli", w));
-        out.push(clip("   contact@fentz.dev", w));
         out.push(String::new());
-        out.push(reverse(&clip(&format!("   {}", tr(K::CheckUpdates)), w)));
+        out.push(clip(&format!(" {}", tr(K::About)), w));
+        out.push(clip(
+            &format!("   scc {} · © 2026 Fentz · MIT License", crate::VERSION),
+            w,
+        ));
+        out.push(clip("   https://github.com/fentz26/sccli", w));
         let result = match &self.update {
-            UpdateCheck::NotRun => return,
+            UpdateCheck::NotRun => String::new(),
             UpdateCheck::Running => tr(K::Checking).to_string(),
             UpdateCheck::Current => tr(K::UpToDate).to_string(),
             UpdateCheck::Available(v) => tr(K::UpdateAvailable).replace("{v}", v),
             UpdateCheck::Failed => tr(K::UpdateFailed).to_string(),
         };
-        out.push(clip(&format!("   {result}"), w));
+        let name = tr(K::CheckUpdates);
+        let pad = " ".repeat(col.saturating_sub(width(name)));
+        let row = clip(&format!("   {name}{pad}   {result}"), w);
+        out.push(if self.set_sel == SETTINGS { reverse(&row) } else { row });
     }
 
     /// Writes only what changed, in one go. Nothing at all is written when nothing changed:
@@ -804,7 +794,6 @@ impl App {
             let mut out = vec![self.tabs()];
             match self.view {
                 View::Settings => self.settings_rows(w, &mut out),
-                View::About => self.about_rows(w, &mut out),
                 _ => self.queue_rows(w, rows, &mut out),
             }
             out.resize(h - 1, String::new());
