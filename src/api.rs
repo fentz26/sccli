@@ -1342,6 +1342,69 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_refresh_does_not_block_the_next_request() {
+        struct CancelFirstScrape {
+            mock: Arc<Mock>,
+            epoch: Arc<AtomicU64>,
+            cancelled: AtomicBool,
+        }
+        impl Transport for CancelFirstScrape {
+            fn get(&self, url: &str, oauth: Option<&str>, timeout: Duration) -> Result<Reply, Failure> {
+                let reply = self.mock.get(url, oauth, timeout);
+                if url == "https://soundcloud.com" && !self.cancelled.swap(true, Ordering::Relaxed) {
+                    self.epoch.fetch_add(1, Ordering::Relaxed);
+                }
+                reply
+            }
+            fn final_url(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+        for token in [None, Some("tok")] {
+            for previous in [None, Some(Instant::now() - net::CLIENT_ID_REFRESH_EVERY)] {
+                let (mut api, mock, _) = api(vec![ok("{}")], token);
+                *mock.dead_id.lock().unwrap() = Some(ID_A.to_string());
+                api.client.lock().unwrap().refreshed = previous;
+                let epoch = Arc::new(AtomicU64::new(0));
+                let cancel = Cancel::tied_to(&epoch);
+                api.http = Box::new(CancelFirstScrape {
+                    mock,
+                    epoch,
+                    cancelled: AtomicBool::new(false),
+                });
+                assert_eq!(api.fetch("https://x/a", &cancel), Err(ApiError::Cancelled));
+                let after_cancel = api.client.lock().unwrap().refreshed;
+                assert_eq!(api.get("https://x/b"), Ok(json!({})));
+                assert_eq!(after_cancel, previous);
+            }
+        }
+    }
+
+    #[test]
+    fn a_network_failure_during_refresh_is_not_a_login_error() {
+        struct OfflineScrape(Arc<Mock>);
+        impl Transport for OfflineScrape {
+            fn get(&self, url: &str, oauth: Option<&str>, timeout: Duration) -> Result<Reply, Failure> {
+                if url == "https://soundcloud.com" {
+                    return Err(Failure::Network);
+                }
+                self.0.get(url, oauth, timeout)
+            }
+            fn final_url(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+        for token in [Some("tok"), None] {
+            let (mut api, mock, _) = api(vec![], token);
+            *mock.dead_id.lock().unwrap() = Some(ID_A.to_string());
+            api.http = Box::new(OfflineScrape(mock));
+            let error = api.get("https://x/a").unwrap_err();
+            assert_eq!(error, ApiError::Network);
+            assert!(error.is_transient());
+        }
+    }
+
+    #[test]
     fn a_rejected_token_is_blamed_on_the_login_not_the_client_id() {
         let (api, m, _) = api(vec![status(401), status(401), status(401)], Some("tok"));
         assert_eq!(api.get("https://x/a").unwrap_err(), ApiError::Auth);
