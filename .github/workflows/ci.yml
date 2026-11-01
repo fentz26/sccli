@@ -33,8 +33,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 1.85 is the declared minimum and Debian 13's compiler; 1.93 is Ubuntu 26.04's newest.
-        rust: ["1.85", "1.93", stable, beta]
+        # 1.85 is the declared minimum. 1.91 builds the Ubuntu 22.04, 24.04 and 26.04 packages,
+        # 1.97 builds Ubuntu 26.10's.
+        rust: ["1.85", "1.91", "1.97", stable, beta]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,6 +78,45 @@ jobs:
         run: cargo test --locked -- --ignored
       - run: cargo build --release --locked
       - run: cargo run --release --locked -- --version
+
+  ubuntu-package:
+    name: package (${{ matrix.series }})
+    runs-on: ubuntu-latest
+    container: ubuntu:${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { series: jammy, image: "22.04" }
+          - { series: noble, image: "24.04" }
+          - { series: resolute, image: "26.04" }
+          - { series: stonking, image: "26.10" }
+    env:
+      SERIES: ${{ matrix.series }}
+    steps:
+      - name: Install packaging tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates cargo debhelper dpkg-dev git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the source package
+        run: |
+          git config --global --add safe.directory "$PWD"
+          packaging/ubuntu/source-package.sh "$SERIES"
+      - name: Build the binary package as Launchpad would, without network access
+        working-directory: build/ppa/${{ matrix.series }}
+        run: |
+          dpkg-source -x ./*.dsc source
+          cd source
+          apt-get build-dep -y ./
+          dpkg-buildpackage -b -us -uc
+      - name: Install it and run it
+        working-directory: build/ppa/${{ matrix.series }}
+        run: |
+          apt-get install -y --no-install-recommends ./sccli_*.deb
+          scc --version
 
   arch:
     runs-on: ubuntu-latest
