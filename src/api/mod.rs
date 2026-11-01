@@ -5,6 +5,8 @@ use crate::{
     config::{self, Quality},
     log,
 };
+#[cfg(windows)]
+mod cancel_io;
 mod process;
 pub mod requests;
 use process::Child;
@@ -104,14 +106,21 @@ impl Ureq {
         // Agent clones share shutdown state. A fresh agent isolates this lookup
         // from API listings and from stream requests for the newly selected song.
         let agent: ureq::Agent = self.0.config().clone().into();
+        #[cfg(windows)]
+        let cancel_io = cancel_io::CancelIo::current();
         thread::scope(|scope| {
             let (done, wait) = mpsc::channel::<()>();
-            let active = agent.clone();
+            let mut active = Some(agent.clone());
             scope.spawn(move || {
                 loop {
                     if cancel.is_stale() {
-                        active.shutdown();
-                        return;
+                        #[cfg(windows)]
+                        if let Some(cancel_io) = &cancel_io {
+                            cancel_io.cancel();
+                        }
+                        if let Some(active) = active.take() {
+                            active.shutdown();
+                        }
                     }
                     match wait.recv_timeout(Duration::from_millis(50)) {
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1168,6 +1177,7 @@ mod tests {
     fn cancellation_interrupts_active_http_without_shutting_down_other_requests() {
         use std::net::TcpListener;
         for mode in 0..3 {
+            eprintln!("testing active cancellation mode {mode}");
             let partial_body = mode == 1;
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
