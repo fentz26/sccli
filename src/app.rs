@@ -1235,6 +1235,7 @@ mod tests {
     struct SlowServer {
         url: String,
         stop: Arc<std::sync::atomic::AtomicBool>,
+        delivered: Arc<AtomicU64>,
         thread: Option<thread::JoinHandle<()>>,
     }
 
@@ -1245,13 +1246,15 @@ mod tests {
             let url = format!("http://{}/slow", listener.local_addr().unwrap());
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stopping = stop.clone();
+            let delivered = Arc::new(AtomicU64::new(0));
+            let sent = delivered.clone();
             let file = Arc::new(wav());
             let handle = thread::spawn(move || {
                 let mut workers = Vec::new();
                 while !stopping.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut conn, _)) => {
-                            let (stop, file) = (stopping.clone(), file.clone());
+                            let (stop, file, sent) = (stopping.clone(), file.clone(), sent.clone());
                             workers.push(thread::spawn(move || {
                                 let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
                                 let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
@@ -1266,15 +1269,17 @@ mod tests {
                                 let body = &file[from.min(total)..];
                                 let header = format!("HTTP/1.1 {}\r\nContent-Type: audio/wav\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nContent-Range: bytes {from}-{}/{total}\r\nConnection: close\r\n\r\n", if from > 0 {"206 Partial Content"} else {"200 OK"}, body.len(), total-1);
                                 if conn.write_all(header.as_bytes()).is_err() { return; }
+                                let started = Instant::now();
                                 for (i, bytes) in body.chunks(chunk).enumerate() {
                                     if stop.load(Ordering::Relaxed) || conn.write_all(bytes).is_err() { return; }
-                                    // Pace bytes in 100ms steps; the burst profile adds
-                                    // a two-second delivery gap after every 40 kB.
-                                    let gap = with_gaps && (i + 1) % 20 == 0;
-                                    let ticks = if gap {21} else {1};
-                                    for _ in 0..ticks {
+                                    sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                                    // Use an absolute schedule: repeated sleeps would
+                                    // accumulate host scheduling jitter and lower the rate.
+                                    let gaps = if with_gaps { (i + 1) / 20 } else { 0 };
+                                    let due = started + Duration::from_millis((i as u64 + 1) * 100 + gaps as u64 * 2000);
+                                    while let Some(left) = due.checked_duration_since(Instant::now()) {
                                         if stop.load(Ordering::Relaxed) { return; }
-                                        thread::sleep(Duration::from_millis(100));
+                                        thread::sleep(left.min(Duration::from_millis(100)));
                                     }
                                 }
                             }));
@@ -1292,6 +1297,7 @@ mod tests {
             Self {
                 url,
                 stop,
+                delivered,
                 thread: Some(handle),
             }
         }
@@ -1369,7 +1375,15 @@ mod tests {
         let started = Instant::now();
         app.go(0);
         run_until(&mut app, &rx, Duration::from_secs(25), |a| a.time > 0.2);
-        assert!(app.time > 0.2, "did not start under paced delivery");
+        assert!(
+            app.time > 0.2,
+            "did not start under paced delivery: phase={:?}, position={:.2}, delivered_bytes={}, cached_secs={:.2}, elapsed_ms={}",
+            app.pb.phase(),
+            app.time,
+            server.delivered.load(Ordering::Relaxed),
+            app.cached_secs,
+            started.elapsed().as_millis()
+        );
         let startup = started.elapsed();
         let stop = Instant::now() + Duration::from_secs(20);
         let mut buffer_entries = 0;
@@ -1393,10 +1407,11 @@ mod tests {
         assert!(app.time >= 10.0, "insufficient playback progress: {}", app.time);
         assert_eq!(app.pb.attempts(), 0);
         eprintln!(
-            "SLOW_STREAM chunk_bytes={chunk} gaps={with_gaps} startup_ms={} observed_ms={} position_s={:.2} buffer_entries={buffer_entries} recoveries=0",
+            "SLOW_STREAM chunk_bytes={chunk} gaps={with_gaps} startup_ms={} observed_ms={} position_s={:.2} buffer_entries={buffer_entries} recoveries=0 delivered_bytes={}",
             startup.as_millis(),
             started.elapsed().as_millis(),
-            app.time
+            app.time,
+            server.delivered.load(Ordering::Relaxed),
         );
     }
 
