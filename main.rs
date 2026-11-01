@@ -4,19 +4,16 @@
 mod api;
 mod app;
 mod config;
-mod diag;
-mod i18n;
-mod ipc;
-mod mpv;
-mod net;
-mod playback;
+mod log;
+mod player;
+mod ui;
 
 use anyhow::{Context, Result, bail};
 use api::Api;
 use clap::Parser;
 use config::{Config, load_config, load_last, save_config};
-use i18n::{K, detect_lang, parse_lang, set_lang, tr};
 use std::io::{Write, stdout};
+use ui::text::{K, detect_lang, parse_lang, set_lang, tr};
 
 /// Calendar version shown to users and used for tags and archives. Cargo needs SemVer, which
 /// forbids the leading zero, so Cargo.toml carries the same version as 26.1.0.
@@ -117,7 +114,7 @@ fn resolve_url_str(u: &str, cfg: &Config) -> Result<String> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.debug {
-        if let Some(path) = diag::enable() {
+        if let Some(path) = log::enable() {
             eprintln!("debug log: {}", path.display());
         }
     }
@@ -185,19 +182,19 @@ mod tests {
     #[test]
     fn lockfile_matches_cargo() {
         let entry = format!("name = \"sccli\"\nversion = \"{}\"\n", env!("CARGO_PKG_VERSION"));
-        assert!(lf(include_str!("../Cargo.lock")).contains(&entry));
+        assert!(lf(include_str!(".cargo/Cargo.lock")).contains(&entry));
     }
 
     #[test]
     fn docs_use_the_current_version() {
-        let guide = include_str!("../docs/verify-release.md");
+        let guide = include_str!("docs/verify-release.md");
         assert!(guide.contains(&format!("sccli-{VERSION}-")));
         assert!(guide.contains(&format!("--source-tag v{VERSION}")));
     }
 
     #[test]
     fn ubuntu_package_matches_version() {
-        assert!(include_str!("../debian/changelog").starts_with(&format!("sccli ({VERSION}-1")));
+        assert!(include_str!("debian/changelog").starts_with(&format!("sccli ({VERSION}-1")));
     }
 
     #[test]
@@ -219,8 +216,8 @@ mod tests {
     #[test]
     fn minimum_rust_version_is_stated_and_tested() {
         let msrv = env!("CARGO_PKG_RUST_VERSION");
-        assert!(include_str!("../README.md").contains(&format!(") {msrv}+")));
-        assert!(include_str!("../.github/workflows/ci.yml").contains(&format!("rust: [\"{msrv}\"")));
+        assert!(include_str!("README.md").contains(&format!(") {msrv}+")));
+        assert!(include_str!(".github/workflows/ci.yml").contains(&format!("rust: [\"{msrv}\"")));
     }
 
     #[test]

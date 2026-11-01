@@ -48,8 +48,10 @@ You need [Rust](https://rustup.rs) 1.85+ and [mpv](https://mpv.io/installation/)
 ```sh
 git clone https://github.com/fentz26/sccli
 cd sccli
-cargo install --locked --path .
+cargo install --locked --path .cargo
 ```
+
+See [Development](docs/development.md) for the source layout and build commands.
 
 </details>
 

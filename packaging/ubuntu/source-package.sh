@@ -25,7 +25,7 @@ tree="$out/sccli-$upstream"
 rm -rf "$out"
 mkdir -p "$tree"
 git archive HEAD | tar -x -C "$tree"
-(cd "$tree" && cargo vendor --locked --quiet vendor > /dev/null)
+(cd "$tree" && cargo vendor --manifest-path .cargo/Cargo.toml --locked --quiet vendor > /dev/null)
 # Ubuntu never links these Windows libraries, and they are most of the source package's size.
 rm -rf "$tree"/vendor/windows_*/lib
 tar -C "$out" --exclude=debian -cJf "$out/sccli_$upstream.orig.tar.xz" "sccli-$upstream"

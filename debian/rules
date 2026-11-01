@@ -4,7 +4,7 @@
 export PATH := $(firstword $(wildcard /usr/lib/rust-1.*/bin)):$(PATH)
 export CARGO_HOME := $(CURDIR)/debian/cargo-home
 
-CARGO_FLAGS := --release --locked --offline --config debian/vendor.toml
+CARGO_FLAGS := --manifest-path .cargo/Cargo.toml --release --locked --offline --config debian/vendor.toml
 
 %:
 	dh $@

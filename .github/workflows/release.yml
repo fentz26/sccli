@@ -8,8 +8,8 @@ on:
   pull_request:
     paths:
       - .github/workflows/release.yml
-      - Cargo.lock
-      - Cargo.toml
+      - .cargo/Cargo.lock
+      - .cargo/Cargo.toml
 
 permissions:
   contents: read
@@ -30,7 +30,7 @@ jobs:
       - name: Read version and match it to the tag
         id: read
         run: |
-          version=$(sed -n 's/^const VERSION: &str = "\(.*\)";$/\1/p' src/main.rs)
+          version=$(sed -n 's/^const VERSION: &str = "\(.*\)";$/\1/p' main.rs)
           test -n "$version"
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match version $version"
@@ -69,7 +69,7 @@ jobs:
           sudo apt-get install -y musl-tools
           echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
       # No build cache here: release binaries must not depend on restored state.
-      - run: cargo build --release --locked --target "$TARGET"
+      - run: cargo build --manifest-path .cargo/Cargo.toml --release --locked --target "$TARGET"
         shell: bash
       - name: Check the binary
         if: matrix.runs

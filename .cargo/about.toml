@@ -1,0 +1,21 @@
+accepted = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# The package manifest lives below the repository's license file.
+[sccli.clarify]
+license = "MIT"
+[[sccli.clarify.files]]
+path = "../LICENSE"
+checksum = "29366195b9e1ade36bec205a830e488b0cd29c45f571e353ac29aef87d655328"
+license = "MIT"

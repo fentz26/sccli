@@ -3,10 +3,12 @@
 
 use crate::{
     config::{self, Quality},
-    diag,
-    net::{self, ApiError, Cancel, Gate, Seen, Step},
+    log,
 };
+pub mod requests;
+
 use anyhow::{Context, Result};
+use requests::{self as net, ApiError, Cancel, Gate, Seen, Step};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -373,7 +375,7 @@ impl Api {
         c.id = Some(id);
         c.generation += 1;
         c.proven = false;
-        diag::event("client_id_refreshed", json!({ "generation": c.generation }));
+        log::event("client_id_refreshed", json!({ "generation": c.generation }));
         Ok(true)
     }
 
@@ -425,7 +427,7 @@ impl Api {
             let latency_ms = started.elapsed().as_millis() as u64;
             let wait = match reply {
                 Ok(r) => {
-                    diag::event(
+                    log::event(
                         "http",
                         json!({ "url": url, "status": r.status, "latency_ms": latency_ms, "attempt": attempt }),
                     );
@@ -473,7 +475,7 @@ impl Api {
                         Failure::Timeout => ApiError::Timeout,
                         Failure::Network => ApiError::Network,
                     };
-                    diag::event(
+                    log::event(
                         "http_failed",
                         json!({ "url": url, "error": last.to_string(), "latency_ms": latency_ms, "attempt": attempt }),
                     );
@@ -490,7 +492,7 @@ impl Api {
             if Instant::now() + wait >= deadline {
                 break;
             }
-            diag::event(
+            log::event(
                 "retry",
                 json!({ "url": url, "wait_ms": wait.as_millis() as u64, "attempt": attempt }),
             );
@@ -743,7 +745,7 @@ fn ytdlp(args: &[&str], token: Option<&str>) -> std::io::Result<Child> {
 /// yt-dlp's stderr without the prompt it prints when reading options from stdin.
 fn ytdlp_errors(stderr: &str) -> String {
     let lines = stderr.lines().filter(|l| !l.starts_with("Reading options from STDIN"));
-    diag::redact(lines.collect::<Vec<_>>().join("\n").trim())
+    log::redact(lines.collect::<Vec<_>>().join("\n").trim())
 }
 
 /// Waits for a program, killing it at `limit`. Output is read on the side so a full pipe
@@ -797,7 +799,7 @@ pub fn ytdlp_list(source: &str, token: Option<&str>, emit: &mut dyn FnMut(Vec<Tr
         Err(e) => {
             return Some(format!(
                 "failed to run yt-dlp ({e}); {}",
-                crate::mpv::install_hint("yt-dlp")
+                crate::player::install_hint("yt-dlp")
             ));
         }
     };
