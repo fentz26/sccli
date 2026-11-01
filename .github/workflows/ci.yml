@@ -39,7 +39,10 @@ jobs:
         run: brew install mpv
       - name: Install mpv (Windows)
         if: runner.os == 'Windows'
-        run: choco install mpvio --no-progress -y
+        shell: pwsh
+        run: |
+          choco install mpvio --no-progress -y
+          Add-Content $env:GITHUB_PATH 'C:\ProgramData\chocolatey\lib\mpvio.install\tools'
       - run: cargo test --locked
       - name: Test against real mpv
         run: cargo test --locked -- --ignored
