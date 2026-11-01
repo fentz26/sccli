@@ -164,6 +164,31 @@ mod tests {
         assert_eq!(VERSION, format!("{}.{minor:02}", env!("CARGO_PKG_VERSION_MAJOR")));
     }
 
+    /// Git may check these out with CRLF on Windows.
+    fn lf(text: &str) -> String {
+        text.replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn lockfile_matches_cargo() {
+        let entry = format!("name = \"sccli\"\nversion = \"{}\"\n", env!("CARGO_PKG_VERSION"));
+        assert!(lf(include_str!("../Cargo.lock")).contains(&entry));
+    }
+
+    #[test]
+    fn readme_uses_the_current_version() {
+        let readme = include_str!("../README.md");
+        assert!(readme.contains(&format!("sccli-{VERSION}-")));
+        assert!(readme.contains(&format!("--source-tag v{VERSION}")));
+    }
+
+    #[test]
+    fn minimum_rust_version_is_stated_and_tested() {
+        let msrv = env!("CARGO_PKG_RUST_VERSION");
+        assert!(include_str!("../README.md").contains(&format!("Rust {msrv}+")));
+        assert!(include_str!("../.github/workflows/ci.yml").contains(&format!("rust: [\"{msrv}\"")));
+    }
+
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
