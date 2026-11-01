@@ -76,10 +76,10 @@ impl Mpv {
             let Ok(reader) = ipc::reader(&conn) else { return };
             let _ = tx.send(Ev::MpvReady(conn));
             for line in BufReader::new(reader).lines().map_while(Result::ok) {
-                if let Ok(v) = serde_json::from_str::<Value>(&line)
-                    && tx.send(Ev::Mpv(v)).is_err()
-                {
-                    break;
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if tx.send(Ev::Mpv(v)).is_err() {
+                        break;
+                    }
                 }
             }
         });
@@ -146,11 +146,10 @@ mod tests {
 
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if let Ok(Ev::Mpv(v)) = rx.recv_timeout(Duration::from_secs(1))
-                && v["name"] == "volume"
-                && v["data"] == 37.0
-            {
-                return;
+            if let Ok(Ev::Mpv(v)) = rx.recv_timeout(Duration::from_secs(1)) {
+                if v["name"] == "volume" && v["data"] == 37.0 {
+                    return;
+                }
             }
         }
         panic!("mpv never applied the command");

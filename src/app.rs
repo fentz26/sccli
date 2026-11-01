@@ -270,9 +270,7 @@ impl App {
                     if self.tracks[base..].iter().any(|t| t.url == last.track) {
                         self.start_at_resume();
                     }
-                } else if let Some(w) = self.want
-                    && w < self.tracks.len()
-                {
+                } else if let Some(w) = self.want.filter(|&w| w < self.tracks.len()) {
                     self.go(w);
                 }
             }
