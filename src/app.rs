@@ -39,6 +39,7 @@ const URL_TTL: Duration = Duration::from_secs(3600);
 const HOVER_DELAY: Duration = Duration::from_millis(120);
 const SAVE_POS_EVERY: Duration = Duration::from_secs(10);
 const NOTE_FOR: Duration = Duration::from_secs(5);
+const SKIP_NOTE_FOR: Duration = Duration::from_secs(30);
 const SETTINGS: usize = 9;
 /// Link lookups running at once for songs nobody is waiting for yet.
 const MAX_PREFETCH: usize = 3;
@@ -200,6 +201,7 @@ struct App {
     volume: f64,
     note: String,
     note_at: Instant,
+    note_for: Duration,
     quit: bool,
     view: View,
     sel: usize,
@@ -260,6 +262,7 @@ impl App {
             volume,
             note: String::new(),
             note_at: Instant::now(),
+            note_for: NOTE_FOR,
             quit: false,
             view: View::Player,
             sel: 0,
@@ -399,6 +402,7 @@ impl App {
     }
 
     fn say(&mut self, text: String) {
+        self.note_for = NOTE_FOR;
         self.note_at = Instant::now();
         self.note = text;
     }
@@ -504,6 +508,7 @@ impl App {
         match f.error {
             ApiError::Protected => {
                 self.say(tr(K::Protected).into());
+                self.note_for = SKIP_NOTE_FOR;
                 self.skip_from(w);
             }
             ApiError::Auth => {
@@ -517,6 +522,7 @@ impl App {
             }
             _ => {
                 self.say(tr(K::Skipped).replace("{e}", &f.detail));
+                self.note_for = SKIP_NOTE_FOR;
                 self.skip_from(w);
             }
         }
@@ -824,7 +830,7 @@ impl App {
 
     fn tick(&mut self) {
         let holding = self.pb.phase() == Phase::Failed; // the reason stays until it is dealt with
-        if !self.note.is_empty() && !self.tracks.is_empty() && !holding && self.note_at.elapsed() >= NOTE_FOR {
+        if !self.note.is_empty() && !self.tracks.is_empty() && !holding && self.note_at.elapsed() >= self.note_for {
             self.note.clear();
             self.dirty = true;
         }
@@ -1277,6 +1283,39 @@ mod tests {
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok(Ev::MpvReady(conn)) => app.mpv.ready(conn),
             _ => panic!("mpv did not connect"),
+        }
+    }
+
+    #[test]
+    #[ignore = "needs mpv installed"]
+    fn skipped_song_reasons_outlast_routine_notices() {
+        for error in [ApiError::Protected, ApiError::Unavailable] {
+            let (mut app, rx, _) = app_with(&[]);
+            connect(&mut app, &rx);
+            app.want = Some(0);
+            // Keep the next song local so a background lookup cannot replace the note.
+            app.urls
+                .insert(app.tracks[1].url.clone(), ("test://next".into(), Instant::now()));
+            let key = app.tracks[0].url.clone();
+            app.on_url(
+                key,
+                app.cfg.settings.quality,
+                Err(StreamFailure {
+                    detail: error.to_string(),
+                    error,
+                }),
+            );
+            assert_eq!(app.cur, 1);
+            app.note_at = Instant::now() - Duration::from_secs(10);
+            app.tick();
+            assert!(!app.note.is_empty(), "skip reason disappeared after ten seconds");
+            app.note_at = Instant::now() - Duration::from_secs(31);
+            app.tick();
+            assert!(app.note.is_empty());
+            app.say("routine notice".into());
+            app.note_at = Instant::now() - Duration::from_secs(6);
+            app.tick();
+            assert!(app.note.is_empty(), "routine notice inherited the skip duration");
         }
     }
 
