@@ -1,7 +1,10 @@
 //! mpv process and its IPC socket. Startup never blocks the UI: commands sent before the
 //! socket is ready wait in `pending`.
 
-use crate::{app::Ev, config::Settings, ipc};
+pub mod ipc;
+pub mod state;
+
+use crate::{app::Ev, config::Settings};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{
