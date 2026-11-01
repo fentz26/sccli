@@ -1,72 +1,82 @@
-# scc
+# sccli
 
-Play SoundCloud in your terminal: your likes, playlists, private sets and search.
+[![CI](https://github.com/fentz26/sccli/actions/workflows/ci.yml/badge.svg)](https://github.com/fentz26/sccli/actions/workflows/ci.yml)
+[![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](docs/verify-release.md)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+Play SoundCloud in your terminal. Paste a link and listen, no account needed.
 
 ```sh
-scc login                                # sign in (paste your oauth_token)
-scc -p likes                             # your likes
-scc https://soundcloud.com/you/likes     # same thing
-scc https://soundcloud.com/artist/sets/name
-scc lofi hip hop                         # search and play
-scc                                      # continue the last song
+scc https://soundcloud.com/artist/sets/playlist
 ```
 
 ## Install
 
-You need [Rust](https://rustup.rs) to build, `mpv` to play, and optionally `yt-dlp`.
-`yt-dlp` is only used for reposts, sets and albums pages, as a fallback, and by `scc login <browser>`.
-
-| System | Dependencies |
-|---|---|
-| Arch | `sudo pacman -S mpv yt-dlp` |
-| Ubuntu / Debian | `sudo apt install mpv yt-dlp` |
-| macOS | `brew install mpv yt-dlp` |
-| Windows | `scoop install mpv yt-dlp` |
-
-Then build it from this folder:
+<details>
+<summary><b>Ubuntu</b></summary>
 
 ```sh
-cargo install --path .
+sudo add-apt-repository ppa:fentyz2601/sccli
+sudo apt install sccli
 ```
 
-## Sign in
+</details>
 
-`scc login` asks you to paste your `oauth_token`:
+<details>
+<summary><b>macOS</b></summary>
 
-1. Log in at soundcloud.com.
-2. Open DevTools → Storage (Firefox, Safari) or Application (Chrome) → Cookies.
-3. Copy the value of `oauth_token`.
+```sh
+brew install fentz26/tap/sccli
+```
 
-`scc login chrome` (or `firefox`, `safari`, `brave`, `edge`) reads it from the browser instead.
-The token is saved in your config file, so treat that file like a password.
+</details>
 
-## Keys
+<details>
+<summary><b>Windows</b></summary>
 
-| Key | Player | Queue (`l`) | Settings (`,`) |
-|---|---|---|---|
-| `space` | pause / resume | pause / resume | pause / resume |
-| `↑` `↓` | volume | move | move |
-| `←` `→` | seek | seek | change value |
-| `enter` | pause / resume | play selected | next value |
-| `n` / `b` | next / previous | next / previous | next / previous |
-| `s` | stop | stop | stop |
-| `+` / `-` | volume | volume | volume |
-| `tab` | open Queue | to Settings | to Queue |
-| `q` | quit | close | close |
+1. Install [mpv](https://mpv.io/installation/), which plays the audio.
+2. Download the `.zip` from [Releases](https://github.com/fentz26/sccli/releases/latest).
+3. Unzip it and run `scc.exe` from a terminal in that folder.
 
-`Ctrl-C` quits from anywhere. In the queue, `PgUp`, `PgDn`, `g` and `G` jump through the list.
+</details>
 
-## Files
+<details>
+<summary><b>From source</b></summary>
 
-| System | Settings and login | Cache |
-|---|---|---|
-| Linux | `~/.config/scc/` (or `$XDG_CONFIG_HOME`) | `~/.cache/scc/` (or `$XDG_CACHE_HOME`) |
-| macOS | `~/.config/scc/` | `~/.cache/scc/` |
-| Windows | `%APPDATA%\scc\` | `%LOCALAPPDATA%\scc\` |
+You need [Rust](https://rustup.rs) 1.85+ and [mpv](https://mpv.io/installation/).
 
-Deleting the cache is safe: the track list is fetched again on the next run.
+```sh
+git clone https://github.com/fentz26/sccli
+cd sccli
+cargo install --locked --path .
+```
 
-## Language
+</details>
 
-The interface follows your system language. Set it in Settings, with `scc lang ja`, or
-with `--lang` for one run. Supported: `en`, `fr`, `zh`, `ja`, `ko`, `es`.
+## Use
+
+```sh
+scc <link>            # a track, playlist or artist
+scc lofi hip hop      # search and play
+scc                   # continue where you left off
+```
+
+Keys are shown on screen. Press `,` for settings.
+
+To play your likes and private tracks, sign in first:
+
+```sh
+scc login
+scc -p likes
+```
+
+## Learn more
+
+- [Usage guide](docs/usage.md)
+- [Verify a release](docs/verify-release.md)
+- [Security policy](SECURITY.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+
+Questions? contact@fentz.dev
+
+MIT licensed. See [LICENSE](LICENSE).

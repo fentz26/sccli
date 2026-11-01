@@ -5,6 +5,8 @@ use crate::config::{self, Quality};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use ureq::ResponseExt;
+
 use std::{
     io::{BufRead, BufReader},
     process::{Command, Stdio},
@@ -36,6 +38,9 @@ pub struct Track {
     pub low: Option<String>,
     #[serde(default)]
     pub auth: Option<String>,
+    /// Secret part of a private link. Private tracks refuse stream requests without it.
+    #[serde(default)]
+    pub secret: Option<String>,
     #[serde(default)]
     pub downloadable: bool,
     /// Only encrypted (DRM) streams exist, which scc does not play.
@@ -65,6 +70,18 @@ fn encode(s: &str) -> String {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
             _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Adds query parameters, skipping absent values.
+fn with_query(url: &str, params: &[(&str, Option<&str>)]) -> String {
+    let mut out = url.to_string();
+    for (key, value) in params {
+        if let Some(value) = value {
+            let sep = if out.contains('?') { '&' } else { '?' };
+            out.push_str(&format!("{sep}{key}={}", encode(value)));
         }
     }
     out
@@ -106,6 +123,10 @@ fn parse_track(v: &Value) -> Option<Track> {
         .collect();
     plain.sort_by_key(|p| p.0);
     let fixed = plain.iter().find(|p| p.0 > 0).map(|p| p.1.clone());
+    let secret = v["secret_token"]
+        .as_str()
+        .or_else(|| url.rsplit('/').next().filter(|s| s.starts_with("s-")))
+        .map(str::to_string);
     Some(Track {
         id,
         url,
@@ -114,6 +135,7 @@ fn parse_track(v: &Value) -> Option<Track> {
         low: fixed.or_else(|| plain.first().map(|p| p.1.clone())),
         best: plain.last().map(|p| p.1.clone()),
         auth: v["track_authorization"].as_str().map(str::to_string),
+        secret,
         downloadable: v["downloadable"].as_bool().unwrap_or(false),
         protected: plain.is_empty() && !all.is_empty(),
     })
@@ -279,6 +301,17 @@ impl Api {
         Ok(())
     }
 
+    /// The mobile app shares on.soundcloud.com links, which redirect to the real page.
+    fn expand(&self, source: &str) -> String {
+        if !source.contains("//on.soundcloud.com/") {
+            return source.to_string();
+        }
+        match self.agent.get(source).header("User-Agent", UA).call() {
+            Ok(r) => r.get_uri().to_string(),
+            Err(_) => source.to_string(),
+        }
+    }
+
     /// Lists a source page by page. Ok(false): not something the API path handles, use yt-dlp.
     pub fn list(&self, source: &str, emit: &mut dyn FnMut(Vec<Track>)) -> Result<bool> {
         if let Some(q) = source.strip_prefix("scsearch25:") {
@@ -287,6 +320,7 @@ impl Api {
             emit(items.iter().filter_map(parse_track).collect());
             return Ok(true);
         }
+        let source = &self.expand(source);
         let bare = source.split(['?', '#']).next().unwrap_or(source).trim_end_matches('/');
         let path = bare.split("soundcloud.com/").nth(1).unwrap_or("");
         let segs: Vec<&str> = path.split('/').collect();
@@ -339,12 +373,14 @@ impl Api {
             t.best.as_ref()
         };
         let Some(pick) = pick else { return Ok(None) };
-        let auth = t
-            .auth
-            .as_deref()
-            .map(|a| format!("?track_authorization={}", encode(a)))
-            .unwrap_or_default();
-        Ok(self.get(&format!("{pick}{auth}"))?["url"].as_str().map(str::to_string))
+        let url = with_query(
+            pick,
+            &[
+                ("track_authorization", t.auth.as_deref()),
+                ("secret_token", t.secret.as_deref()),
+            ],
+        );
+        Ok(self.get(&url)?["url"].as_str().map(str::to_string))
     }
 
     /// The uploader's original file, which can be lossless. SoundCloud counts this as a download.
@@ -352,17 +388,19 @@ impl Api {
         if !t.downloadable || t.id == 0 {
             return None;
         }
-        self.get(&format!("{API}/tracks/{}/download", t.id)).ok()?["redirectUri"]
+        let url = format!("{API}/tracks/{}/download", t.id);
+        self.get(&with_query(&url, &[("secret_token", t.secret.as_deref())]))
+            .ok()?["redirectUri"]
             .as_str()
             .map(str::to_string)
     }
 
     /// Direct playable URL. Stored track data can be stale, so failure re-reads the track once.
     pub fn stream(&self, t: &Track, q: Quality) -> Result<String, StreamError> {
-        if q == Quality::Original
-            && let Some(u) = self.original(t)
-        {
-            return Ok(u);
+        if q == Quality::Original {
+            if let Some(u) = self.original(t) {
+                return Ok(u);
+            }
         }
         if t.protected {
             return Err(StreamError::Protected);
@@ -371,7 +409,8 @@ impl Api {
             return Ok(u);
         }
         let fresh = if t.id != 0 {
-            self.get(&format!("{API}/tracks/{}", t.id))
+            let url = format!("{API}/tracks/{}", t.id);
+            self.get(&with_query(&url, &[("secret_token", t.secret.as_deref())]))
         } else {
             self.resolve(&t.url)
         };
@@ -444,6 +483,7 @@ pub fn ytdlp_list(source: &str, token: Option<&str>, emit: &mut dyn FnMut(Vec<Tr
             best: None,
             low: None,
             auth: None,
+            secret: None,
             downloadable: false,
             protected: false,
         }]);
@@ -550,6 +590,29 @@ mod tests {
         let mut v = track(vec![]);
         v["title"] = json!("a\u{1b}]0;evil\u{7}b");
         assert_eq!(parse_track(&v).unwrap().title, "artist — a]0;evilb");
+    }
+
+    #[test]
+    fn reads_secret_from_field_or_private_link() {
+        let mut v = track(vec![]);
+        assert_eq!(parse_track(&v).unwrap().secret, None);
+        v["permalink_url"] = json!("https://soundcloud.com/a/b/s-link");
+        assert_eq!(parse_track(&v).unwrap().secret.as_deref(), Some("s-link"));
+        v["secret_token"] = json!("s-field");
+        assert_eq!(parse_track(&v).unwrap().secret.as_deref(), Some("s-field"));
+    }
+
+    #[test]
+    fn stream_requests_carry_authorization_and_secret() {
+        let url = with_query(
+            "https://x/stream",
+            &[
+                ("track_authorization", Some("a b")),
+                ("secret_token", Some("s-1")),
+                ("none", None),
+            ],
+        );
+        assert_eq!(url, "https://x/stream?track_authorization=a%20b&secret_token=s-1");
     }
 
     #[test]

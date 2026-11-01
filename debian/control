@@ -1,0 +1,18 @@
+Source: sccli
+Section: sound
+Priority: optional
+Maintainer: Fentz <contact@fentz.dev>
+Build-Depends: debhelper-compat (= 13), cargo-1.91, rustc-1.91
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/fentz26/sccli
+Vcs-Git: https://github.com/fentz26/sccli.git
+Vcs-Browser: https://github.com/fentz26/sccli
+
+Package: sccli
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, mpv
+Recommends: yt-dlp
+Description: play SoundCloud in your terminal
+ Paste a SoundCloud link and listen, with no account needed. Sign in to play
+ your likes and private tracks. The command is scc.

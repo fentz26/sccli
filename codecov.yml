@@ -1,0 +1,10 @@
+# Coverage is shown for information and never blocks a change.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+comment: false

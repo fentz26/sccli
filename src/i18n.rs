@@ -205,12 +205,12 @@ const TABLE: [[&str; 6]; 42] = [
     ],
     // LoginPrompt
     [
-        "Paste your SoundCloud oauth_token.\nFind it: log in at soundcloud.com → DevTools → Storage/Application → Cookies → oauth_token\n(or run `scc login chrome` / safari / firefox / brave to read it automatically)\n",
-        "Collez votre oauth_token SoundCloud.\nOù le trouver : connectez-vous sur soundcloud.com → DevTools → Stockage/Application → Cookies → oauth_token\n(ou lancez `scc login chrome` / safari / firefox / brave pour le lire automatiquement)\n",
-        "请粘贴你的 SoundCloud oauth_token。\n获取方式：在 soundcloud.com 登录 → 开发者工具 → 存储/应用 → Cookie → oauth_token\n（或运行 `scc login chrome` / safari / firefox / brave 自动读取）\n",
-        "SoundCloud の oauth_token を貼り付けてください。\n取得方法：soundcloud.com にログイン → 開発者ツール → ストレージ/アプリケーション → Cookie → oauth_token\n（または `scc login chrome` / safari / firefox / brave で自動取得）\n",
-        "SoundCloud oauth_token을 붙여넣으세요.\n찾는 방법: soundcloud.com 로그인 → 개발자 도구 → 저장소/애플리케이션 → 쿠키 → oauth_token\n(또는 `scc login chrome` / safari / firefox / brave 로 자동 읽기)\n",
-        "Pega tu oauth_token de SoundCloud.\nDónde encontrarlo: inicia sesión en soundcloud.com → DevTools → Almacenamiento/Aplicación → Cookies → oauth_token\n(o ejecuta `scc login chrome` / safari / firefox / brave para leerlo automáticamente)\n",
+        "Paste your SoundCloud oauth_token.\nFind it: log in at soundcloud.com → DevTools → Storage/Application → Cookies → oauth_token\n",
+        "Collez votre oauth_token SoundCloud.\nOù le trouver : connectez-vous sur soundcloud.com → DevTools → Stockage/Application → Cookies → oauth_token\n",
+        "请粘贴你的 SoundCloud oauth_token。\n获取方式：在 soundcloud.com 登录 → 开发者工具 → 存储/应用 → Cookie → oauth_token\n",
+        "SoundCloud の oauth_token を貼り付けてください。\n取得方法：soundcloud.com にログイン → 開発者ツール → ストレージ/アプリケーション → Cookie → oauth_token\n",
+        "SoundCloud oauth_token을 붙여넣으세요.\n찾는 방법: soundcloud.com 로그인 → 개발자 도구 → 저장소/애플리케이션 → 쿠키 → oauth_token\n",
+        "Pega tu oauth_token de SoundCloud.\nDónde encontrarlo: inicia sesión en soundcloud.com → DevTools → Almacenamiento/Aplicación → Cookies → oauth_token\n",
     ],
     // Playing / Paused / Stopped (terminal title)
     [
@@ -341,22 +341,17 @@ pub fn tr(k: K) -> &'static str {
     TABLE[k as usize][LANG.load(Ordering::Relaxed)]
 }
 
-/// Picks the language: --lang, SCC_LANG, saved setting, then the system locale.
+/// Picks the language: `-l`, saved setting, then the system locale.
 pub fn detect_lang(flag: Option<&str>, saved: Option<&str>) -> Lang {
     let sys = ["LC_ALL", "LC_MESSAGES", "LANG"]
         .iter()
         .filter_map(|k| std::env::var(k).ok())
         .find(|v| !v.is_empty());
-    [
-        flag.map(str::to_string),
-        std::env::var("SCC_LANG").ok(),
-        saved.map(str::to_string),
-        sys,
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(|c| parse_lang(&c))
-    .unwrap_or(Lang::En)
+    [flag.map(str::to_string), saved.map(str::to_string), sys]
+        .into_iter()
+        .flatten()
+        .find_map(|c| parse_lang(&c))
+        .unwrap_or(Lang::En)
 }
 
 /// Truncates to a terminal column width (CJK characters take two columns).

@@ -270,9 +270,7 @@ impl App {
                     if self.tracks[base..].iter().any(|t| t.url == last.track) {
                         self.start_at_resume();
                     }
-                } else if let Some(w) = self.want
-                    && w < self.tracks.len()
-                {
+                } else if let Some(w) = self.want.filter(|&w| w < self.tracks.len()) {
                     self.go(w);
                 }
             }
@@ -789,8 +787,10 @@ pub fn run(source: String, cfg: Config, looping: bool, shuffle_on: bool, resume:
     let mut cached = (!source.starts_with("scsearch"))
         .then(|| config::load_list(&source, signed_in))
         .flatten();
-    if shuffle_on && let Some(c) = &mut cached {
-        shuffle(c);
+    if shuffle_on {
+        if let Some(c) = &mut cached {
+            shuffle(c);
+        }
     }
     let have_cache = cached.is_some();
     spawn_list(api.clone(), source.clone(), cfg.token.clone(), have_cache, tx.clone());

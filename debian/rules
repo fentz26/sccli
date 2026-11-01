@@ -1,0 +1,31 @@
+#!/usr/bin/make -f
+
+# Ubuntu installs versioned Rust compilers next to its default one.
+export PATH := $(firstword $(wildcard /usr/lib/rust-1.*/bin)):$(PATH)
+export CARGO_HOME := $(CURDIR)/debian/cargo-home
+
+CARGO_FLAGS := --release --locked --offline --config debian/vendor.toml
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build $(CARGO_FLAGS)
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test $(CARGO_FLAGS)
+endif
+
+override_dh_auto_install:
+	install -Dm755 target/release/scc debian/sccli/usr/bin/scc
+
+override_dh_auto_clean:
+	rm -rf target debian/cargo-home
+
+# Vendored crates need their Cargo.toml.orig files, which dh_clean would delete.
+override_dh_clean:
+	dh_clean -XCargo.toml.orig
+
+# Release builds are already stripped.
+override_dh_dwz:
