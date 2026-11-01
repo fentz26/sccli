@@ -1230,6 +1230,82 @@ mod tests {
         base
     }
 
+    /// A real HTTP connection with paced delivery. This shapes application bytes,
+    /// not TCP packets, and never changes the machine's network configuration.
+    struct SlowServer {
+        url: String,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl SlowServer {
+        fn start(with_gaps: bool, chunk: usize) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}/slow", listener.local_addr().unwrap());
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = stop.clone();
+            let file = Arc::new(wav());
+            let handle = thread::spawn(move || {
+                let mut workers = Vec::new();
+                while !stopping.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut conn, _)) => {
+                            let (stop, file) = (stopping.clone(), file.clone());
+                            workers.push(thread::spawn(move || {
+                                let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+                                let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
+                                let Ok(reader) = conn.try_clone() else { return };
+                                let mut from = 0usize;
+                                for line in BufReader::new(reader).lines().map_while(Result::ok).take_while(|l| !l.is_empty()) {
+                                    if let Some(range) = line.to_lowercase().strip_prefix("range: bytes=") {
+                                        from = range.split('-').next().unwrap_or("0").parse().unwrap_or(0);
+                                    }
+                                }
+                                let total = file.len();
+                                let body = &file[from.min(total)..];
+                                let header = format!("HTTP/1.1 {}\r\nContent-Type: audio/wav\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nContent-Range: bytes {from}-{}/{total}\r\nConnection: close\r\n\r\n", if from > 0 {"206 Partial Content"} else {"200 OK"}, body.len(), total-1);
+                                if conn.write_all(header.as_bytes()).is_err() { return; }
+                                for (i, bytes) in body.chunks(chunk).enumerate() {
+                                    if stop.load(Ordering::Relaxed) || conn.write_all(bytes).is_err() { return; }
+                                    // Pace bytes in 100ms steps; the burst profile adds
+                                    // a two-second delivery gap after every 40 kB.
+                                    let gap = with_gaps && (i + 1) % 20 == 0;
+                                    let ticks = if gap {21} else {1};
+                                    for _ in 0..ticks {
+                                        if stop.load(Ordering::Relaxed) { return; }
+                                        thread::sleep(Duration::from_millis(100));
+                                    }
+                                }
+                            }));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for worker in workers {
+                    let _ = worker.join();
+                }
+            });
+            Self {
+                url,
+                stop,
+                thread: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for SlowServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.thread.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
     fn track(url: &str, secs: u32) -> Track {
         Track {
             id: 7,
@@ -1284,6 +1360,57 @@ mod tests {
             Ok(Ev::MpvReady(conn)) => app.mpv.ready(conn),
             _ => panic!("mpv did not connect"),
         }
+    }
+
+    fn measure_slow_delivery(with_gaps: bool, chunk: usize) {
+        let server = SlowServer::start(with_gaps, chunk);
+        let (mut app, rx, _) = app_with(std::slice::from_ref(&server.url));
+        connect(&mut app, &rx);
+        let started = Instant::now();
+        app.go(0);
+        run_until(&mut app, &rx, Duration::from_secs(25), |a| a.time > 0.2);
+        assert!(app.time > 0.2, "did not start under paced delivery");
+        let startup = started.elapsed();
+        let stop = Instant::now() + Duration::from_secs(20);
+        let mut buffer_entries = 0;
+        let mut last_phase = app.pb.phase();
+        while Instant::now() < stop {
+            if let Ok(event) = rx.recv_timeout(Duration::from_millis(50)) {
+                app.handle(event);
+            }
+            app.tick();
+            let phase = app.pb.phase();
+            if phase == Phase::Buffering && phase != last_phase {
+                buffer_entries += 1;
+            }
+            assert!(
+                !matches!(phase, Phase::Stalled | Phase::Recovering | Phase::Failed),
+                "false recovery under paced delivery: {phase:?}"
+            );
+            assert_eq!(app.cur, 0, "advanced during paced delivery");
+            last_phase = phase;
+        }
+        assert!(app.time >= 10.0, "insufficient playback progress: {}", app.time);
+        assert_eq!(app.pb.attempts(), 0);
+        eprintln!(
+            "SLOW_STREAM chunk_bytes={chunk} gaps={with_gaps} startup_ms={} observed_ms={} position_s={:.2} buffer_entries={buffer_entries} recoveries=0",
+            startup.as_millis(),
+            started.elapsed().as_millis(),
+            app.time
+        );
+    }
+
+    #[test]
+    #[ignore = "needs mpv installed; measures paced HTTP delivery"]
+    fn slow_delivery_with_and_without_gaps_does_not_trigger_recovery() {
+        measure_slow_delivery(false, 1000);
+        measure_slow_delivery(true, 2000);
+    }
+
+    #[test]
+    #[ignore = "needs mpv installed; measures paced HTTP delivery"]
+    fn below_playback_rate_delivery_buffers_without_triggering_recovery() {
+        measure_slow_delivery(false, 400);
     }
 
     #[test]

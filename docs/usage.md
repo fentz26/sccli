@@ -96,7 +96,9 @@ OAuth tokens receive HTTP 401. These have not been tested:
 
 - Expired OAuth tokens, a formerly valid client ID expiring mid-session, blocked-track 403
   responses and real 429 rate limits from SoundCloud.
-- Packet loss and slow connections. Buffer sizes stay as they are until these are measured.
+- Packet loss under an OS-level network shaper and slow live SoundCloud connections.
+  [Local paced-delivery tests](network-testing.md) cover slow HTTP delivery and rebuffering;
+  buffer sizes stay unchanged.
 - `/s-...` private share links. Private tracks in your likes do play while signed in.
 - The on-screen player on Linux and Windows.
 
