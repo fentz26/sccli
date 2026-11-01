@@ -66,15 +66,27 @@ The interface follows your system language. To keep a different one, change it i
 ## When the connection drops
 
 scc watches playback and recovers by itself. It gets a fresh link and continues from where the
-song stopped, up to five times over about 30 seconds. If the network is still gone, it holds your
-place and shows that the connection was lost, so press `enter` to try again. A song that really
-cannot be played is skipped, and the reason stays on screen.
+song stopped, up to five times over about 30 seconds. If that does not work, it stays on the song
+and shows why. Press `enter` to try again from the same place, or `n` to move on.
+
+A song SoundCloud says you cannot play, such as a removed or DRM protected one, is skipped with a
+short note.
 
 ## Troubleshooting
 
 `scc --debug` writes a log to `debug.log` in the cache folder, covering requests, retries,
 buffering and recovery. Tokens, signed links and private link codes are removed, so it is safe
 to attach to a bug report.
+
+## Known limitations
+
+Recovery is tested against real mpv with a local server that fails on demand, and SoundCloud
+responses are simulated. These have not been tested:
+
+- Real 401, 403 and 429 responses from SoundCloud.
+- Packet loss and slow connections. Buffer sizes stay as they are until these are measured.
+- `/s-...` private share links. Private tracks in your likes do play while signed in.
+- The on-screen player on Linux and Windows.
 
 ## Files
 
