@@ -76,6 +76,7 @@ scc -p likes
 - [Verify a release](docs/verify-release.md)
 - [Security policy](SECURITY.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Third-party licenses](THIRD_PARTY_LICENSES.md)
 
 Questions? contact@fentz.dev
 
