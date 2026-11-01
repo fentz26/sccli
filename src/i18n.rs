@@ -199,12 +199,12 @@ const TABLE: [[&str; 6]; 54] = [
     ],
     // StreamFailed
     [
-        "stream failed, skipping",
-        "échec du flux, passage au suivant",
-        "播放失败，已跳过",
-        "再生に失敗したためスキップします",
-        "재생 실패, 건너뜁니다",
-        "falló la reproducción, se omite",
+        "Stream keeps failing, press enter to retry or n to skip",
+        "Le flux échoue sans cesse, appuyez sur entrée pour réessayer ou n pour passer",
+        "播放持续失败，按回车重试或按 n 跳过",
+        "再生に失敗し続けています。Enter で再試行、n でスキップ",
+        "재생이 계속 실패합니다. Enter로 다시 시도하거나 n으로 건너뛰세요",
+        "La reproducción sigue fallando, pulsa intro para reintentar o n para saltar",
     ],
     // Shuffle
     [

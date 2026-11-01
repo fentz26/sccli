@@ -378,16 +378,23 @@ impl App {
                         .replace("{max}", &MAX_RECOVERIES.to_string()),
                 );
             }
-            Loss::GaveUp if self.offline => {
-                diag::event("recovery_failed", json!({ "pos": self.time }));
-                self.mpv.send(json!(["set_property", "pause", true]));
-            }
-            Loss::GaveUp => {
-                diag::event("recovery_failed", json!({ "pos": self.time, "stream": true }));
-                self.say(tr(K::StreamFailed).into());
-                self.skip_from(self.cur);
-            }
+            Loss::GaveUp => self.hold(),
         }
+    }
+
+    /// Recovery ran out. Stays on the song and says why, so nothing is skipped unseen; enter
+    /// tries again and `n` moves on.
+    fn hold(&mut self) {
+        diag::event("recovery_failed", json!({ "pos": self.time, "offline": self.offline }));
+        self.mpv.send(json!(["set_property", "pause", true]));
+        self.say(
+            tr(if self.offline {
+                K::ConnectionLost
+            } else {
+                K::StreamFailed
+            })
+            .into(),
+        );
     }
 
     fn say(&mut self, text: String) {
@@ -563,6 +570,7 @@ impl App {
                     Some("duration") => {
                         if let Some(d) = d.as_f64().filter(|_| self.pb.started()) {
                             self.dur = d;
+                            self.pb.set_duration(d);
                         }
                     }
                     Some("volume") => self.volume = d.as_f64().unwrap_or(100.0),
@@ -584,12 +592,13 @@ impl App {
                 );
                 match self.pb.end_file(reason, entry, self.dur, now) {
                     End::Ignored => {}
-                    End::Finished | End::CutOffAgain if self.repeat == Repeat::One => self.go(self.cur),
-                    End::Finished | End::CutOffAgain => {
+                    End::Finished if self.repeat == Repeat::One => self.go(self.cur),
+                    End::Finished => {
                         self.back = false;
                         self.go(self.cur + 1)
                     }
                     End::Lost(loss) => self.on_lost(loss),
+                    End::CutOffAgain => self.hold(),
                 }
             }
             _ => {}
@@ -678,6 +687,7 @@ impl App {
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Char(' ') | KeyCode::Enter if self.pb.phase() == Phase::Failed => {
                 self.mpv.send(json!(["set_property", "pause", false]));
+                self.note.clear();
                 let pos = self.pb.retry_now(Instant::now());
                 self.reload(pos);
             }
@@ -812,7 +822,8 @@ impl App {
     }
 
     fn tick(&mut self) {
-        if !self.note.is_empty() && !self.tracks.is_empty() && self.note_at.elapsed() >= NOTE_FOR {
+        let holding = self.pb.phase() == Phase::Failed; // the reason stays until it is dealt with
+        if !self.note.is_empty() && !self.tracks.is_empty() && !holding && self.note_at.elapsed() >= NOTE_FOR {
             self.note.clear();
             self.dirty = true;
         }
@@ -883,9 +894,7 @@ impl App {
             .filter(|_| !self.shuffle_pending)
             .map_or(waiting, |t| t.title.as_str());
         let more = if self.list_done { "" } else { "+" };
-        let note = if self.pb.phase() == Phase::Failed && self.offline {
-            format!("  ({})", tr(K::ConnectionLost))
-        } else if self.note.is_empty() {
+        let note = if self.note.is_empty() {
             String::new()
         } else {
             format!("  ({})", self.note)
@@ -1194,8 +1203,12 @@ mod tests {
                     );
                     let _ = conn.write_all(head.as_bytes());
                     if path.contains("/hang") {
-                        let _ = conn.write_all(&part[..5 * BYTES_PER_SEC]);
-                        thread::sleep(Duration::from_secs(120)); // connected, sending nothing
+                        if from == 0 {
+                            let _ = conn.write_all(&part[..5 * BYTES_PER_SEC]);
+                        }
+                        // Connected and sending nothing. A reconnect hangs too, or mpv's own
+                        // timeout could race the stall detection and fix it unseen.
+                        thread::sleep(Duration::from_secs(120));
                         return;
                     }
                     let keep = if path.contains("/cut") {
@@ -1363,6 +1376,42 @@ mod tests {
             a.pb.phase() == Phase::Playing && a.time > lost_at
         });
         assert_eq!(app.pb.phase(), Phase::Playing);
+        assert!(app.time > lost_at, "lost the position: {} after {lost_at}", app.time);
+    }
+
+    #[test]
+    #[ignore = "needs mpv installed"]
+    fn a_stream_that_keeps_ending_early_holds_the_song_and_says_why() {
+        let base = serve();
+        let (mut app, rx, m) = app_with(&vec![format!("{base}/cut"); 12]);
+        connect(&mut app, &rx);
+        app.go(0);
+        run_until(&mut app, &rx, Duration::from_secs(20), |a| a.time >= 3.0);
+        let lost_at = app.time;
+
+        run_until(&mut app, &rx, Duration::from_secs(90), |a| {
+            a.pb.phase() == Phase::Failed
+        });
+        assert_eq!(app.pb.phase(), Phase::Failed, "kept retrying without end");
+        assert_eq!(app.cur, 0, "moved on from the song");
+        assert!(!app.quit);
+
+        // The reason outlasts the normal note time.
+        app.note_at = Instant::now() - NOTE_FOR * 2;
+        app.tick();
+        assert!(app.status().contains(tr(K::StreamFailed)), "{}", app.status());
+
+        m.script.lock().unwrap().clear();
+        m.script
+            .lock()
+            .unwrap()
+            .push_back(ok(&json!({ "url": format!("{base}/whole") }).to_string()));
+        app.play_key(KeyCode::Enter, KeyModifiers::NONE);
+        run_until(&mut app, &rx, Duration::from_secs(20), |a| {
+            a.pb.phase() == Phase::Playing && a.time > lost_at
+        });
+        assert_eq!(app.pb.phase(), Phase::Playing);
+        assert_eq!(app.cur, 0);
         assert!(app.time > lost_at, "lost the position: {} after {lost_at}", app.time);
     }
 }

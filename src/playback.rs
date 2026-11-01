@@ -15,8 +15,11 @@ const SETTLE_AFTER: Duration = Duration::from_secs(25);
 pub const MAX_RECOVERIES: u32 = 5;
 /// Uninterrupted playback that shows a recovery really worked.
 const HEALTHY_AFTER: Duration = Duration::from_secs(20);
-/// An `eof` this far from the end means the stream was cut off.
+/// An `eof` this far from the end means the stream was cut off. Only the listed length is
+/// known when mpv reports none, so that case gets the full margin.
 const CUT_OFF_MARGIN: f64 = 10.0;
+const CUT_OFF_MIN_MARGIN: f64 = 2.0;
+const CUT_OFF_SHARE: f64 = 0.05;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Phase {
@@ -40,7 +43,7 @@ pub enum End {
     Ignored,
     Finished,
     Lost(Loss),
-    /// Kept ending early through every attempt, so it probably is that short.
+    /// Kept ending early through every attempt.
     CutOffAgain,
 }
 
@@ -62,6 +65,8 @@ pub struct Playback {
     seeking: bool,
     cache_wait: bool,
     pos: f64,
+    /// Length mpv reports for the current file.
+    reported: Option<f64>,
     /// Where to continue after a loss.
     anchor: f64,
     progress_at: Instant,
@@ -81,6 +86,7 @@ impl Playback {
             seeking: false,
             cache_wait: false,
             pos: 0.0,
+            reported: None,
             anchor: 0.0,
             progress_at: now,
             played_once: false,
@@ -119,6 +125,7 @@ impl Playback {
     pub fn loading(&mut self, now: Instant) {
         self.load += 1;
         self.started = false;
+        self.reported = None;
         self.seeking = false;
         self.cache_wait = false;
         self.progress_at = now;
@@ -138,6 +145,27 @@ impl Playback {
 
     fn is_current(&self, entry: Option<i64>) -> bool {
         self.started && entry.is_none_or(|id| id == self.load)
+    }
+
+    pub fn set_duration(&mut self, dur: f64) {
+        if self.started && dur > 0.0 {
+            self.reported = Some(dur);
+        }
+    }
+
+    /// Whether a stream that ended at `pos` stopped short. Sources can disagree, so it counts
+    /// as complete if it reached the end by either: a file may run short of its listed length,
+    /// and a length estimated from the bitrate may run long of the real one.
+    fn cut_off(&self, pos: f64, listed: f64) -> bool {
+        let listed = (listed > 0.0).then_some(listed);
+        let Some(end) = [self.reported, listed].into_iter().flatten().reduce(f64::min) else {
+            return false;
+        };
+        let margin = match self.reported {
+            Some(_) => (end * CUT_OFF_SHARE).clamp(CUT_OFF_MIN_MARGIN, CUT_OFF_MARGIN),
+            None => CUT_OFF_MARGIN,
+        };
+        end - pos > margin
     }
 
     pub fn restarted(&mut self, now: Instant) {
@@ -194,7 +222,7 @@ impl Playback {
             return End::Ignored;
         }
         match reason {
-            Some("eof") if dur - self.pos.max(self.anchor) > CUT_OFF_MARGIN => match self.lost(now) {
+            Some("eof") if self.cut_off(self.pos.max(self.anchor), dur) => match self.lost(now) {
                 Loss::GaveUp => End::CutOffAgain,
                 retry => End::Lost(retry),
             },
@@ -317,6 +345,51 @@ mod tests {
         );
         let mut p = playing(t0, 58.0);
         assert_eq!(p.end_file(Some("eof"), Some(1), 60.0, t0 + S), End::Finished);
+    }
+
+    #[test]
+    fn early_endings_scale_with_the_length_of_the_track() {
+        let t0 = Instant::now();
+        let ended_at = |pos: f64, reported: f64, listed: f64| {
+            let mut p = playing(t0, pos);
+            p.set_duration(reported);
+            p.end_file(Some("eof"), Some(1), listed, t0 + S)
+        };
+        // A short track cut off well inside the fixed margin.
+        assert_eq!(ended_at(4.0, 12.0, 12.0), End::Lost(Loss::Retrying(1)));
+        // Ordinary rounding at the end of a short track.
+        assert_eq!(ended_at(11.0, 12.0, 12.0), End::Finished);
+        // Long tracks keep the capped margin.
+        assert_eq!(ended_at(3592.0, 3600.0, 3600.0), End::Finished);
+        assert_eq!(ended_at(3580.0, 3600.0, 3600.0), End::Lost(Loss::Retrying(1)));
+    }
+
+    #[test]
+    fn disagreeing_lengths_do_not_cause_false_alarms() {
+        let t0 = Instant::now();
+        let ended_at = |pos: f64, reported: f64, listed: f64| {
+            let mut p = playing(t0, pos);
+            p.set_duration(reported);
+            p.end_file(Some("eof"), Some(1), listed, t0 + S)
+        };
+        // The file really is shorter than the listing says.
+        assert_eq!(ended_at(29.5, 30.0, 200.0), End::Finished);
+        // mpv estimated long from the bitrate, but it reached the listed end.
+        assert_eq!(ended_at(190.0, 215.0, 190.0), End::Finished);
+        // No listed length, as with yt-dlp results.
+        assert_eq!(ended_at(100.0, 180.0, 0.0), End::Lost(Loss::Retrying(1)));
+    }
+
+    #[test]
+    fn a_length_from_the_old_file_does_not_apply_to_the_new_one() {
+        let t0 = Instant::now();
+        let mut p = playing(t0, 5.0);
+        p.set_duration(10.0);
+        p.select(t0);
+        p.loading(t0);
+        p.set_duration(300.0); // arrives before start-file, so it is the old file's
+        p.start_file(Some(2));
+        assert_eq!(p.reported, None);
     }
 
     #[test]

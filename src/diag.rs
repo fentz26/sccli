@@ -16,8 +16,9 @@ pub fn enable() -> Option<std::path::PathBuf> {
     let dir = config::cache_dir();
     fs::create_dir_all(&dir).ok()?;
     let path = dir.join("debug.log");
+    let _ = fs::remove_file(&path); // an existing file would keep its old permissions
     let mut open = OpenOptions::new();
-    open.create(true).write(true).truncate(true);
+    open.create_new(true).write(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
     let _ = LOG.set(Mutex::new(open.open(&path).ok()?));
@@ -37,16 +38,41 @@ fn line(name: &str, fields: Value) -> String {
     let mut m = Map::new();
     m.insert("ts_ms".into(), json!(ms));
     m.insert("event".into(), json!(name));
-    if let Value::Object(f) = fields {
-        for (k, v) in f {
-            let v = match v {
-                Value::String(s) => Value::String(redact(&s)),
-                other => other,
-            };
-            m.insert(k, v);
-        }
+    if let Value::Object(f) = scrub("", fields) {
+        m.extend(f);
     }
     Value::Object(m).to_string()
+}
+
+/// Redacts at every depth. A field named like a secret loses its whole value.
+fn scrub(key: &str, v: Value) -> Value {
+    let key = key.to_lowercase();
+    let secret = [
+        "token",
+        "authorization",
+        "client_id",
+        "secret",
+        "signature",
+        "policy",
+        "cookie",
+    ]
+    .iter()
+    .any(|s| key.contains(s));
+    match v {
+        Value::Null => Value::Null,
+        _ if secret => json!("<redacted>"),
+        Value::String(s) => Value::String(redact(&s)),
+        Value::Array(a) => Value::Array(a.into_iter().map(|v| scrub("", v)).collect()),
+        Value::Object(o) => Value::Object(
+            o.into_iter()
+                .map(|(k, v)| {
+                    let c = scrub(&k, v);
+                    (k, c)
+                })
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Removes what could give access: query strings (client ids, signatures, stream
@@ -124,6 +150,21 @@ mod tests {
             "Authorization:OAuth <redacted> next"
         );
         assert_eq!(redact("cookie oauth_token=2-abc"), "cookie oauth_token=<redacted>");
+    }
+
+    #[test]
+    fn redaction_reaches_nested_values() {
+        let l = line(
+            "http",
+            json!({
+                "outer": { "url": "https://x/a?client_id=SECRET", "list": ["OAuth SECRET", { "deep": "https://x/b/s-SECRET" }] },
+                "track_authorization": "SECRET",
+                "headers": { "Authorization": "SECRET" },
+                "attempts": [1, 2],
+            }),
+        );
+        assert!(!l.contains("SECRET"), "{l}");
+        assert!(l.contains("\"attempts\":[1,2]"), "{l}");
     }
 
     #[test]

@@ -130,6 +130,8 @@ struct ClientId {
     /// A request has succeeded with this id.
     proven: bool,
     refreshed: Option<Instant>,
+    /// The last scrape got an answer without an id, so a refusal proves nothing about the login.
+    scrape_failed: bool,
 }
 
 pub struct Api {
@@ -154,6 +156,25 @@ fn encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Sets the client id. `next_href` links arrive with one already, which may be older than
+/// the current id, so it is replaced rather than left alone.
+fn with_client_id(url: &str, id: &str) -> String {
+    let setting = format!("client_id={id}");
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    let mut found = false;
+    let mut params: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+    for p in &mut params {
+        if p.starts_with("client_id=") {
+            *p = &setting;
+            found = true;
+        }
+    }
+    if !found {
+        params.push(&setting);
+    }
+    format!("{path}?{}", params.join("&"))
 }
 
 /// Adds query parameters, skipping absent values.
@@ -243,6 +264,7 @@ impl Api {
                 generation: 0,
                 proven: false,
                 refreshed: None,
+                scrape_failed: false,
             }),
             gate: Gate::new(net::MAX_CONCURRENT),
             save_client_id: true,
@@ -320,21 +342,34 @@ impl Api {
     }
 
     /// Replaces a rejected id. Whoever arrives first scrapes; the rest find the new generation
-    /// and just retry. Returns false when no new id can be had right now.
+    /// and just retry. Returns false when this id was scraped moments ago, which means the
+    /// refusal is not about the client id. A scrape that could not finish says nothing either
+    /// way, so it reports its own error and leaves the next caller free to try.
     fn refresh_client_id(&self, rejected: u64, deadline: Instant, cancel: &Cancel) -> Result<bool, ApiError> {
         let mut c = self.lock_client(deadline, cancel)?;
         if c.generation != rejected {
             return Ok(true);
         }
         if c.refreshed.is_some_and(|t| t.elapsed() < net::CLIENT_ID_REFRESH_EVERY) {
-            return Ok(false);
+            return if c.scrape_failed {
+                Err(ApiError::ClientId)
+            } else {
+                Ok(false)
+            };
         }
-        c.refreshed = Some(Instant::now());
+        let before = c.refreshed.replace(Instant::now());
         let id = match self.scrape_client_id(deadline, cancel) {
             Ok(id) => id,
-            Err(e @ (ApiError::Timeout | ApiError::Cancelled)) => return Err(e),
-            Err(_) => return Ok(false),
+            Err(e) if e.is_transient() || e == ApiError::Cancelled => {
+                c.refreshed = before;
+                return Err(e);
+            }
+            Err(e) => {
+                c.scrape_failed = true;
+                return Err(e);
+            }
         };
+        c.scrape_failed = false;
         c.id = Some(id);
         c.generation += 1;
         c.proven = false;
@@ -380,11 +415,7 @@ impl Api {
                 return Err(ApiError::Cancelled);
             }
             let (id, generation, id_proven) = self.client_id(deadline, cancel)?;
-            let full = if url.contains("client_id=") {
-                url.to_string()
-            } else {
-                format!("{url}{}client_id={id}", if url.contains('?') { '&' } else { '?' })
-            };
+            let full = with_client_id(url, &id);
             let started = Instant::now();
             let reply = {
                 let _permit = self.gate.enter(deadline, cancel)?;
@@ -969,6 +1000,7 @@ pub mod mock {
                 generation: 0,
                 proven: false,
                 refreshed: None,
+                scrape_failed: false,
             }),
             gate: Gate::new(net::MAX_CONCURRENT),
             save_client_id: false,
@@ -1462,13 +1494,16 @@ mod tests {
     #[test]
     fn listing_timeout_still_applies_after_stdout_closes() {
         let child = Command::new("sh")
-            .args(["-c", "exec 1>&-; exec sleep 1"])
+            .args(["-c", "exec 1>&-; exec sleep 30"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        let t0 = Instant::now();
         let result = list_child(child, &mut |_| {}, Duration::from_millis(50), Duration::from_secs(5));
         assert_eq!(result.as_deref(), Some("yt-dlp stopped responding"));
+        // Reporting it is not enough: the process has to be killed, not waited out.
+        assert!(t0.elapsed() < Duration::from_secs(10), "took {:?}", t0.elapsed());
     }
 
     #[cfg(unix)]
@@ -1521,5 +1556,122 @@ mod tests {
         let (_, out, err) = finish_within(child, Duration::from_secs(20)).unwrap();
         assert_eq!(out.len(), 2_000_000);
         assert_eq!(err.trim(), "oops");
+    }
+
+    #[test]
+    fn the_client_id_is_set_exactly_once() {
+        assert_eq!(with_client_id("https://x/a", "new"), "https://x/a?client_id=new");
+        assert_eq!(
+            with_client_id("https://x/a?limit=2", "new"),
+            "https://x/a?limit=2&client_id=new"
+        );
+        assert_eq!(
+            with_client_id("https://x/a?cursor=9&client_id=old&limit=2", "new"),
+            "https://x/a?cursor=9&client_id=new&limit=2"
+        );
+        assert_eq!(
+            with_client_id("https://x/a?client_id=old", "new"),
+            "https://x/a?client_id=new"
+        );
+        assert_eq!(
+            with_client_id("https://x/a?oauth_client_id=keep", "new"),
+            "https://x/a?oauth_client_id=keep&client_id=new"
+        );
+    }
+
+    #[test]
+    fn a_next_href_with_a_stale_client_id_uses_the_refreshed_one() {
+        let (api, m, _) = api(vec![ok("{\"a\":1}")], None);
+        *m.dead_id.lock().unwrap() = Some(ID_A.to_string());
+        let next = format!("https://x/likes?cursor=9&client_id={ID_A}&limit=200");
+        assert_eq!(api.get(&next).unwrap()["a"], 1);
+        let calls = m.calls.lock().unwrap();
+        let last = &calls.last().unwrap().0;
+        assert_eq!(last, &format!("https://x/likes?cursor=9&client_id={ID_B}&limit=200"));
+    }
+
+    /// A transport that changes the world when the client id scrape begins.
+    struct DuringScrape {
+        inner: Arc<Mock>,
+        epoch: Arc<AtomicU64>,
+        offline: Arc<AtomicBool>,
+    }
+
+    impl Transport for DuringScrape {
+        fn get(&self, url: &str, oauth: Option<&str>, timeout: Duration) -> Result<Reply, Failure> {
+            if url == "https://soundcloud.com" {
+                self.epoch.fetch_add(1, Ordering::Relaxed);
+                if self.offline.load(Ordering::Relaxed) {
+                    return Err(Failure::Network);
+                }
+            }
+            self.inner.get(url, oauth, timeout)
+        }
+
+        fn final_url(&self, _: &str) -> Option<String> {
+            None
+        }
+    }
+
+    fn with_dead_client_id() -> (Api, Arc<Mock>, Arc<AtomicU64>, Arc<AtomicBool>) {
+        let (mut api, m, _) = api(vec![], Some("tok"));
+        let epoch = Arc::new(AtomicU64::new(0));
+        let offline = Arc::new(AtomicBool::new(false));
+        api.http = Box::new(DuringScrape {
+            inner: m.clone(),
+            epoch: epoch.clone(),
+            offline: offline.clone(),
+        });
+        *m.dead_id.lock().unwrap() = Some(ID_A.to_string());
+        (api, m, epoch, offline)
+    }
+
+    #[test]
+    fn a_cancelled_refresh_leaves_the_next_caller_free_to_refresh() {
+        let (api, _, epoch, _) = with_dead_client_id();
+        let preload = Cancel::tied_to(&epoch);
+        assert_eq!(
+            api.fetch("https://x/preload", &preload).unwrap_err(),
+            ApiError::Cancelled
+        );
+        assert!(api.get("https://x/song").is_ok());
+    }
+
+    #[test]
+    fn a_refresh_that_cannot_connect_does_not_blame_the_login() {
+        let (api, _, _, offline) = with_dead_client_id();
+        offline.store(true, Ordering::Relaxed);
+        assert_eq!(api.get("https://x/song").unwrap_err(), ApiError::Network);
+        offline.store(false, Ordering::Relaxed);
+        assert!(
+            api.get("https://x/song").is_ok(),
+            "the failed attempt started the cooldown"
+        );
+    }
+
+    #[test]
+    fn a_scrape_that_finds_no_id_does_not_blame_the_login() {
+        struct NoId;
+        impl Transport for NoId {
+            fn get(&self, url: &str, _: Option<&str>, _: Duration) -> Result<Reply, Failure> {
+                let status = if url == "https://soundcloud.com" { 200 } else { 401 };
+                Ok(Reply {
+                    status,
+                    retry_after: None,
+                    body: String::new(),
+                })
+            }
+            fn final_url(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+        let (mut api, _, _) = api(vec![], Some("tok"));
+        api.http = Box::new(NoId);
+        assert_eq!(api.get("https://x/a").unwrap_err(), ApiError::ClientId);
+        assert_eq!(
+            api.get("https://x/b").unwrap_err(),
+            ApiError::ClientId,
+            "second call within the cooldown"
+        );
     }
 }
