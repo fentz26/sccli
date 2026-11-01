@@ -1,0 +1,3 @@
+# Keep build output in this project even if a parent folder's Cargo config redirects it.
+[build]
+target-dir = "target"
