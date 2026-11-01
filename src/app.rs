@@ -45,8 +45,18 @@ pub enum Ev {
     /// Fresh full list, replacing the cached one that is on screen.
     Replace(Vec<Track>),
     Url(String, Result<String, Option<String>>), // Err(None): protected stream
+    /// Result of an update check; Ok(None) means nothing newer is published.
+    Update(Result<Option<String>, ()>),
     Key(KeyEvent),
     Resize,
+}
+
+enum UpdateCheck {
+    NotRun,
+    Running,
+    Current,
+    Available(String),
+    Failed,
 }
 
 /// Lists a source. With a cached list on screen, collects quietly and swaps it in at the end.
@@ -90,6 +100,16 @@ fn spawn_stream(api: Arc<Api>, t: Track, q: Quality, token: Option<String>, tx: 
             Err(StreamError::Other) => api::ytdlp_stream(&t.url, token.as_deref()).map_err(Some),
         };
         let _ = tx.send(Ev::Url(t.url, r));
+    });
+}
+
+fn spawn_update_check(api: Arc<Api>, tx: Sender<Ev>) {
+    thread::spawn(move || {
+        let r = api
+            .latest_version()
+            .map(|v| v.filter(|v| api::is_newer(v, crate::VERSION)))
+            .map_err(|_| ());
+        let _ = tx.send(Ev::Update(r));
     });
 }
 
@@ -155,6 +175,7 @@ struct App {
     sel: usize,
     top: usize,
     set_sel: usize,
+    update: UpdateCheck,
     hover: Option<Instant>,
     saved_pos: Instant,
     // What is on screen now, so only changes are written.
@@ -254,6 +275,13 @@ impl App {
             Ev::Key(k) if k.kind != KeyEventKind::Release => self.key(k.code, k.modifiers),
             Ev::Key(_) => {}
             Ev::Resize => self.frame.clear(),
+            Ev::Update(r) => {
+                self.update = match r {
+                    Ok(Some(v)) => UpdateCheck::Available(v),
+                    Ok(None) => UpdateCheck::Current,
+                    Err(()) => UpdateCheck::Failed,
+                };
+            }
             Ev::MpvReady(s) => self.mpv.ready(s),
             Ev::MpvFailed(e) => {
                 self.note = e;
@@ -442,10 +470,19 @@ impl App {
             KeyCode::Char('l') | KeyCode::Char('q') | KeyCode::Char(',') | KeyCode::Esc => self.set_view(View::Player),
             KeyCode::Tab => self.set_view(View::Queue),
             KeyCode::Up | KeyCode::Char('k') => self.set_sel = self.set_sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.set_sel = (self.set_sel + 1).min(SETTINGS - 1),
+            KeyCode::Down | KeyCode::Char('j') => self.set_sel = (self.set_sel + 1).min(SETTINGS),
+            KeyCode::Enter if self.set_sel == SETTINGS => self.check_for_updates(),
+            KeyCode::Right | KeyCode::Left if self.set_sel == SETTINGS => {}
             KeyCode::Right | KeyCode::Enter => self.change(1),
             KeyCode::Left => self.change(-1),
             _ => self.play_key(code, mods),
+        }
+    }
+
+    fn check_for_updates(&mut self) {
+        if !matches!(self.update, UpdateCheck::Running) {
+            self.update = UpdateCheck::Running;
+            spawn_update_check(self.api.clone(), self.tx.clone());
         }
     }
 
@@ -704,6 +741,24 @@ impl App {
             let row = clip(&format!("   {name}{pad}   ‹ {value} ›"), w);
             out.push(if i == self.set_sel { reverse(&row) } else { row });
         }
+        out.push(String::new());
+        out.push(clip(&format!(" {}", tr(K::About)), w));
+        out.push(clip(
+            &format!("   scc {} · © 2026 Fentz · MIT License", crate::VERSION),
+            w,
+        ));
+        out.push(clip("   https://github.com/fentz26/sccli", w));
+        let result = match &self.update {
+            UpdateCheck::NotRun => String::new(),
+            UpdateCheck::Running => tr(K::Checking).to_string(),
+            UpdateCheck::Current => tr(K::UpToDate).to_string(),
+            UpdateCheck::Available(v) => tr(K::UpdateAvailable).replace("{v}", v),
+            UpdateCheck::Failed => tr(K::UpdateFailed).to_string(),
+        };
+        let name = tr(K::CheckUpdates);
+        let pad = " ".repeat(col.saturating_sub(width(name)));
+        let row = clip(&format!("   {name}{pad}   {result}"), w);
+        out.push(if self.set_sel == SETTINGS { reverse(&row) } else { row });
     }
 
     /// Writes only what changed, in one go. Nothing at all is written when nothing changed:
@@ -829,6 +884,7 @@ pub fn run(source: String, cfg: Config, looping: bool, shuffle_on: bool, resume:
         sel: 0,
         top: 0,
         set_sel: 0,
+        update: UpdateCheck::NotRun,
         hover: None,
         saved_pos: Instant::now(),
         dirty: true,

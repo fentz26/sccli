@@ -81,9 +81,15 @@ pub enum K {
     Normal,
     High,
     Protected,
+    About,
+    CheckUpdates,
+    Checking,
+    UpToDate,
+    UpdateAvailable,
+    UpdateFailed,
 }
 
-const TABLE: [[&str; 6]; 42] = [
+const TABLE: [[&str; 6]; 48] = [
     // Help
     [
         "space pause/resume · n next · b prev · s stop · ←/→ seek · ↑/↓ volume · l list · , settings · q quit",
@@ -335,6 +341,48 @@ const TABLE: [[&str; 6]; 42] = [
         "보호된 스트림, 건너뜀",
         "transmisión protegida, omitida",
     ],
+    // About section of Settings
+    ["About", "À propos", "关于", "情報", "정보", "Acerca de"],
+    [
+        "Check for updates",
+        "Rechercher des mises à jour",
+        "检查更新",
+        "アップデートを確認",
+        "업데이트 확인",
+        "Buscar actualizaciones",
+    ],
+    [
+        "Checking…",
+        "Vérification…",
+        "正在检查…",
+        "確認中…",
+        "확인 중…",
+        "Comprobando…",
+    ],
+    [
+        "You have the latest version",
+        "Vous avez la dernière version",
+        "已是最新版本",
+        "最新バージョンです",
+        "최신 버전입니다",
+        "Tienes la última versión",
+    ],
+    [
+        "Version {v} is available",
+        "La version {v} est disponible",
+        "新版本 {v} 可用",
+        "バージョン {v} が利用可能です",
+        "버전 {v}을(를) 사용할 수 있습니다",
+        "La versión {v} está disponible",
+    ],
+    [
+        "Could not check for updates",
+        "Impossible de vérifier les mises à jour",
+        "无法检查更新",
+        "アップデートを確認できませんでした",
+        "업데이트를 확인할 수 없습니다",
+        "No se pudo buscar actualizaciones",
+    ],
 ];
 
 pub fn tr(k: K) -> &'static str {
@@ -405,6 +453,7 @@ mod tests {
             (K::Queue, "{more}"),
             (K::SignedIn, "{user}"),
             (K::Skipped, "{e}"),
+            (K::UpdateAvailable, "{v}"),
         ] {
             assert!(TABLE[row as usize].iter().all(|s| s.contains(key)), "{key}");
         }
