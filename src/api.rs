@@ -810,14 +810,24 @@ fn list_child(
     silence: Duration,
     limit: Duration,
 ) -> Option<String> {
-    let err = child.stderr.take().map(|mut e| {
-        thread::spawn(move || {
-            let mut s = String::new();
-            let _ = std::io::Read::read_to_string(&mut e, &mut s);
-            s
-        })
+    let (err_tx, err_rx) = mpsc::channel();
+    let stderr = child.stderr.take();
+    thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_string(&mut text);
+        }
+        let _ = err_tx.send(text);
     });
     let stdout = child.stdout.take().unwrap();
+    let (line_tx, line_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
     let child = Arc::new(Mutex::new(child));
     let started = Instant::now();
     let heard = Arc::new(AtomicU64::new(0));
@@ -839,7 +849,12 @@ fn list_child(
             }
         });
     }
-    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+    while !stuck.load(Ordering::Relaxed) {
+        let line = match line_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => line,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         heard.store(started.elapsed().as_secs(), Ordering::Relaxed);
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -886,13 +901,23 @@ fn list_child(
             }
         }
     }
+    // A descendant can keep either pipe open after yt-dlp exits.
+    let mut error = None;
+    while !stuck.load(Ordering::Relaxed) {
+        match err_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(text) => {
+                error = Some(ytdlp_errors(&text)).filter(|s| !s.is_empty());
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
     finished.store(true, Ordering::Relaxed);
     if stuck.load(Ordering::Relaxed) {
         return Some("yt-dlp stopped responding".to_string());
     }
-    err.and_then(|h| h.join().ok())
-        .map(|s| ytdlp_errors(&s))
-        .filter(|s| !s.is_empty())
+    error
 }
 
 /// Fallback stream lookup when the API path fails.
@@ -1567,6 +1592,27 @@ mod tests {
         assert_eq!(result.as_deref(), Some("yt-dlp stopped responding"));
         // Reporting it is not enough: the process has to be killed, not waited out.
         assert!(t0.elapsed() < Duration::from_secs(10), "took {:?}", t0.elapsed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_timeout_does_not_wait_for_grandchild_pipes() {
+        for script in ["sleep 4 & exec sleep 30", "exec 1>&-; sleep 4 & exit 0"] {
+            let child = Command::new("sh")
+                .args(["-c", script])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let t0 = Instant::now();
+            let result = list_child(child, &mut |_| {}, Duration::from_millis(50), Duration::from_secs(5));
+            assert_eq!(result.as_deref(), Some("yt-dlp stopped responding"));
+            assert!(
+                t0.elapsed() < Duration::from_secs(2),
+                "{script}: took {:?}",
+                t0.elapsed()
+            );
+        }
     }
 
     #[cfg(unix)]
