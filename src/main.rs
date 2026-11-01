@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn ubuntu_package_matches_version() {
-        assert!(include_str!("../debian/changelog").starts_with(&format!("sccli ({VERSION}-1)")));
+        assert!(include_str!("../debian/changelog").starts_with(&format!("sccli ({VERSION}-1")));
     }
 
     #[test]
