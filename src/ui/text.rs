@@ -93,9 +93,19 @@ pub enum K {
     ConnectionLost,
     Reconnecting,
     ListIncomplete,
+    TabSearch,
+    TabPlaylists,
+    FilterTyping,
+    FilterActive,
+    SearchPrompt,
+    SearchHint,
+    PlaylistHint,
+    NoMatches,
+    NoPlaylists,
+    SavedShortcut,
 }
 
-const TABLE: [[&str; 6]; 54] = [
+const TABLE: [[&str; 6]; 64] = [
     // Help
     [
         "space pause/resume · n next · b prev · s stop · ←/→ seek · ↑/↓ volume · l list · , settings · q quit",
@@ -118,12 +128,12 @@ const TABLE: [[&str; 6]; 54] = [
     ["vol", "vol", "音量", "音量", "볼륨", "vol"],
     // Queue ({n}, {more})
     [
-        "{n} tracks{more}  ↑/↓ move · enter play · space pause · n/b skip · tab settings · l/esc back",
-        "{n} titres{more}  ↑/↓ déplacer · entrée lire · espace pause · n/b passer · tab réglages · l/échap retour",
-        "{n} 首{more}  ↑/↓ 移动 · 回车 播放 · 空格 暂停 · n/b 切歌 · tab 设置 · l/esc 返回",
-        "{n} 曲{more}  ↑/↓ 移動 · Enter 再生 · スペース 一時停止 · n/b スキップ · Tab 設定 · l/Esc 戻る",
-        "{n}곡{more}  ↑/↓ 이동 · Enter 재생 · 스페이스 일시정지 · n/b 건너뛰기 · Tab 설정 · l/Esc 뒤로",
-        "{n} pistas{more}  ↑/↓ mover · intro reproducir · espacio pausa · n/b saltar · tab ajustes · l/esc volver",
+        "{n} tracks{more}  ↑/↓ move · enter play · space pause · n/b skip · / filter · ctrl+f search · tab next · l/esc back",
+        "{n} titres{more}  ↑/↓ déplacer · entrée lire · espace pause · n/b passer · / filtrer · ctrl+f chercher · tab suivant · l/échap retour",
+        "{n} 首{more}  ↑/↓ 移动 · 回车 播放 · 空格 暂停 · n/b 切歌 · / 筛选 · ctrl+f 搜索 · tab 下一页 · l/esc 返回",
+        "{n} 曲{more}  ↑/↓ 移動 · Enter 再生 · スペース 一時停止 · n/b スキップ · / 絞り込み · Ctrl+F 検索 · Tab 次へ · l/Esc 戻る",
+        "{n}곡{more}  ↑/↓ 이동 · Enter 재생 · 스페이스 일시정지 · n/b 건너뛰기 · / 필터 · Ctrl+F 검색 · Tab 다음 · l/Esc 뒤로",
+        "{n} pistas{more}  ↑/↓ mover · intro reproducir · espacio pausa · n/b saltar · / filtrar · ctrl+f buscar · tab siguiente · l/esc volver",
     ],
     // More
     [
@@ -239,12 +249,12 @@ const TABLE: [[&str; 6]; 54] = [
     ["Queue", "File d'attente", "播放队列", "キュー", "재생목록", "Cola"],
     ["Settings", "Réglages", "设置", "設定", "설정", "Ajustes"],
     [
-        "↑/↓ move · ←/→ change · space pause · tab queue · l/esc back",
-        "↑/↓ déplacer · ←/→ modifier · espace pause · tab file · l/échap retour",
-        "↑/↓ 移动 · ←/→ 更改 · 空格 暂停 · tab 队列 · l/esc 返回",
-        "↑/↓ 移動 · ←/→ 変更 · スペース 一時停止 · Tab キュー · l/Esc 戻る",
+        "↑/↓ move · ←/→ change · space pause · tab next · l/esc back",
+        "↑/↓ déplacer · ←/→ modifier · espace pause · tab suivant · l/échap retour",
+        "↑/↓ 移动 · ←/→ 更改 · 空格 暂停 · tab 下一页 · l/esc 返回",
+        "↑/↓ 移動 · ←/→ 変更 · スペース 一時停止 · Tab 次へ · l/Esc 戻る",
         "↑/↓ 이동 · ←/→ 변경 · 스페이스 일시정지 · Tab 재생목록 · l/Esc 뒤로",
-        "↑/↓ mover · ←/→ cambiar · espacio pausa · tab cola · l/esc volver",
+        "↑/↓ mover · ←/→ cambiar · espacio pausa · tab siguiente · l/esc volver",
     ],
     // Setting names
     ["Language", "Langue", "语言", "言語", "언어", "Idioma"],
@@ -431,6 +441,82 @@ const TABLE: [[&str; 6]; 54] = [
         "목록이 불완전합니다: {e}",
         "lista incompleta: {e}",
     ],
+    // TabSearch
+    ["Search", "Recherche", "搜索", "検索", "검색", "Buscar"],
+    // TabPlaylists
+    [
+        "Playlists",
+        "Playlists",
+        "歌单",
+        "プレイリスト",
+        "플레이리스트",
+        "Listas",
+    ],
+    // FilterTyping
+    [
+        "Filter: {q} ({n}/{total}) · enter keep · esc clear",
+        "Filtre : {q} ({n}/{total}) · entrée garder · échap effacer",
+        "筛选：{q} ({n}/{total}) · 回车确认 · esc 清除",
+        "絞り込み: {q} ({n}/{total}) · Enter 確定 · Esc 解除",
+        "필터: {q} ({n}/{total}) · Enter 적용 · Esc 지우기",
+        "Filtro: {q} ({n}/{total}) · intro guardar · esc borrar",
+    ],
+    // FilterActive
+    [
+        "Filter: {q} ({n}/{total}) · / edit · enter play · esc clear",
+        "Filtre : {q} ({n}/{total}) · / modifier · entrée lire · échap effacer",
+        "筛选：{q} ({n}/{total}) · / 编辑 · 回车播放 · esc 清除",
+        "絞り込み: {q} ({n}/{total}) · / 編集 · Enter 再生 · Esc 解除",
+        "필터: {q} ({n}/{total}) · / 편집 · Enter 재생 · Esc 지우기",
+        "Filtro: {q} ({n}/{total}) · / editar · intro reproducir · esc borrar",
+    ],
+    // SearchPrompt
+    [
+        "SoundCloud: {q} · enter search · esc cancel",
+        "SoundCloud : {q} · entrée chercher · échap annuler",
+        "SoundCloud：{q} · 回车搜索 · esc 取消",
+        "SoundCloud: {q} · Enter 検索 · Esc キャンセル",
+        "SoundCloud: {q} · Enter 검색 · Esc 취소",
+        "SoundCloud: {q} · intro buscar · esc cancelar",
+    ],
+    // SearchHint
+    [
+        "{q} · ↑/↓ select · enter play results · / edit search",
+        "{q} · ↑/↓ choisir · entrée lire · / rechercher",
+        "{q} · ↑/↓ 选择 · 回车播放结果 · / 新搜索",
+        "{q} · ↑/↓ 選択 · Enter 結果を再生 · / 新規検索",
+        "{q} · ↑/↓ 선택 · Enter 결과 재생 · / 새 검색",
+        "{q} · ↑/↓ elegir · intro reproducir · / nueva búsqueda",
+    ],
+    // PlaylistHint
+    [
+        "↑/↓ select · enter open · r refresh · tab next",
+        "↑/↓ choisir · entrée ouvrir · r actualiser · tab suivant",
+        "↑/↓ 选择 · 回车打开 · r 刷新 · tab 下一页",
+        "↑/↓ 選択 · Enter 開く · r 更新 · Tab 次へ",
+        "↑/↓ 선택 · Enter 열기 · r 새로고침 · Tab 다음",
+        "↑/↓ elegir · intro abrir · r actualizar · tab siguiente",
+    ],
+    // NoMatches
+    [
+        "No matches",
+        "Aucun résultat",
+        "无匹配结果",
+        "一致する結果がありません",
+        "일치하는 결과 없음",
+        "Sin coincidencias",
+    ],
+    // NoPlaylists
+    [
+        "No playlists · save a shortcut with scc alias <name> <url>",
+        "Aucune playlist · scc alias <nom> <url>",
+        "暂无歌单 · scc alias <名称> <网址>",
+        "プレイリストなし · scc alias <名前> <URL>",
+        "플레이리스트 없음 · scc alias <이름> <URL>",
+        "Sin listas · scc alias <nombre> <url>",
+    ],
+    // SavedShortcut
+    ["saved", "enregistré", "已保存", "保存済み", "저장됨", "guardado"],
 ];
 
 pub fn tr(k: K) -> &'static str {
@@ -505,6 +591,14 @@ mod tests {
             (K::Reconnecting, "{n}"),
             (K::Reconnecting, "{max}"),
             (K::ListIncomplete, "{e}"),
+            (K::FilterTyping, "{q}"),
+            (K::FilterTyping, "{n}"),
+            (K::FilterTyping, "{total}"),
+            (K::FilterActive, "{q}"),
+            (K::FilterActive, "{n}"),
+            (K::FilterActive, "{total}"),
+            (K::SearchPrompt, "{q}"),
+            (K::SearchHint, "{q}"),
         ] {
             assert!(TABLE[row as usize].iter().all(|s| s.contains(key)), "{key}");
         }

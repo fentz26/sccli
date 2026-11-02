@@ -1,16 +1,21 @@
-//! The player: event loop, playback queue, and the Queue and Settings tabs.
+//! Player event loop, queue, and terminal tabs. Browsing lives in app/browse.rs.
 
 use crate::{
     api::requests::{ApiError, Cancel},
-    api::{self, Api, Track},
+    api::{self, Api, Playlist, Track},
     config::{self, Config, Last, Memory, Quality, Repeat},
     log,
     player::{
         Mpv, ipc,
         state::{End, Loss, MAX_RECOVERIES, Phase, Playback, Tick},
     },
-    ui::text::{self, K, clip, tr, width},
+    ui::{
+        browser::{self, Input, Playlists, Search},
+        text::{self, K, clip, tr, width},
+    },
 };
+mod browse;
+
 use anyhow::{Result, bail};
 use crossterm::{
     cursor::{Hide, MoveTo, MoveToColumn, Show},
@@ -54,10 +59,13 @@ pub enum Ev {
     Mpv(Value),
     MpvReady(ipc::Conn),
     MpvFailed(String),
-    Tracks(Vec<Track>),
-    ListDone(Option<String>),
+    Tracks(u64, Vec<Track>),
+    ListDone(u64, Option<String>),
     /// Fresh full list, replacing the cached one that is on screen.
-    Replace(Vec<Track>),
+    Replace(u64, Vec<Track>),
+    SearchDone(u64, String, Result<Vec<Track>, String>),
+    PlaylistsDone(Result<Vec<Playlist>, String>),
+    PlaylistDone(u64, String, Result<Vec<Track>, String>),
     Url(String, Quality, Result<String, StreamFailure>),
     /// Result of an update check; Ok(None) means nothing newer is published.
     Update(Result<Option<String>, ()>),
@@ -74,14 +82,14 @@ enum UpdateCheck {
 }
 
 /// Lists a source. With a cached list on screen, collects quietly and swaps it in at the end.
-fn spawn_list(api: Arc<Api>, source: String, token: Option<String>, cached: bool, tx: Sender<Ev>) {
+fn spawn_list(api: Arc<Api>, source: String, token: Option<String>, cached: bool, generation: u64, tx: Sender<Ev>) {
     thread::spawn(move || {
         let mut all: Vec<Track> = vec![];
         let count = Cell::new(0);
         let mut emit = |page: Vec<Track>| {
             count.set(count.get() + page.len());
             if !cached {
-                let _ = tx.send(Ev::Tracks(page.clone()));
+                let _ = tx.send(Ev::Tracks(generation, page.clone()));
             }
             all.extend(page);
         };
@@ -99,9 +107,9 @@ fn spawn_list(api: Arc<Api>, source: String, token: Option<String>, cached: bool
             config::save_list(&source, token.is_some(), &all);
         }
         if !cached {
-            let _ = tx.send(Ev::ListDone(err));
+            let _ = tx.send(Ev::ListDone(generation, err));
         } else if complete {
-            let _ = tx.send(Ev::Replace(all));
+            let _ = tx.send(Ev::Replace(generation, all));
         }
     });
 }
@@ -165,6 +173,8 @@ fn reverse(s: &str) -> String {
 enum View {
     Player,
     Queue,
+    Search,
+    Playlists,
     Settings,
 }
 
@@ -207,6 +217,11 @@ struct App {
     sel: usize,
     top: usize,
     set_sel: usize,
+    queue_filter: Input,
+    search: Search,
+    playlists: Playlists,
+    browse_epoch: Arc<AtomicU64>,
+    list_generation: u64,
     update: UpdateCheck,
     hover: Option<Instant>,
     saved_pos: Instant,
@@ -268,6 +283,11 @@ impl App {
             sel: 0,
             top: 0,
             set_sel: 0,
+            queue_filter: Input::default(),
+            search: Search::default(),
+            playlists: Playlists::default(),
+            browse_epoch: Arc::new(AtomicU64::new(0)),
+            list_generation: 0,
             update: UpdateCheck::NotRun,
             hover: None,
             saved_pos: Instant::now(),
@@ -337,7 +357,7 @@ impl App {
         }
         let prev = self.cur;
         self.cur = idx;
-        if self.view != View::Player && self.sel == prev {
+        if self.queue_filter.text.is_empty() && self.sel == prev {
             self.sel = idx; // the cursor follows the song unless you moved it away
         }
         config::save_last(&self.source, &self.tracks[idx].url, 0.0);
@@ -443,9 +463,12 @@ impl App {
                 self.tracks.clear();
                 self.quit = true;
             }
-            Ev::Tracks(page) => {
+            Ev::Tracks(generation, page) if generation == self.list_generation => {
                 let base = self.tracks.len();
                 self.tracks.extend(page);
+                if !self.queue_filter.text.is_empty() {
+                    self.reconcile_filter();
+                }
                 if self.shuffle_pending {
                     return;
                 }
@@ -457,7 +480,7 @@ impl App {
                     self.play(w);
                 }
             }
-            Ev::ListDone(err) => {
+            Ev::ListDone(generation, err) if generation == self.list_generation => {
                 self.list_done = true;
                 if let Some(e) = err.as_ref().filter(|e| !e.is_empty() && !self.tracks.is_empty()) {
                     self.say(tr(K::ListIncomplete).replace("{e}", e));
@@ -475,7 +498,54 @@ impl App {
                     self.play(w);
                 }
             }
-            Ev::Replace(new) => self.replace_list(new),
+            Ev::Replace(generation, new) if generation == self.list_generation => {
+                self.replace_list(new);
+                self.reconcile_filter();
+            }
+            Ev::Tracks(..) | Ev::ListDone(..) | Ev::Replace(..) => {}
+            Ev::SearchDone(id, query, result) if id == self.browse_epoch.load(Ordering::Relaxed) => {
+                self.search.loading = false;
+                self.search.query = query;
+                match result {
+                    Ok(tracks) => {
+                        self.search.tracks = tracks;
+                        self.search.error = None;
+                        self.search.selected = 0;
+                        self.search.top = 0;
+                    }
+                    Err(error) => self.search.error = Some(error),
+                }
+            }
+            Ev::SearchDone(..) => {}
+            Ev::PlaylistsDone(result) => {
+                self.playlists.loading = false;
+                self.playlists.loaded = true;
+                match result {
+                    Ok(items) => {
+                        self.playlists.items = self.saved_playlists();
+                        for item in items {
+                            if !self.playlists.items.iter().any(|p| p.url == item.url) {
+                                self.playlists.items.push(item);
+                            }
+                        }
+                        self.playlists.error = None;
+                    }
+                    Err(error) => self.playlists.error = Some(error),
+                }
+                self.playlists.selected = self
+                    .playlists
+                    .selected
+                    .min(self.playlists.items.len().saturating_sub(1));
+            }
+            Ev::PlaylistDone(id, source, result) if id == self.browse_epoch.load(Ordering::Relaxed) => {
+                self.playlists.opening = false;
+                match result {
+                    Ok(tracks) if !tracks.is_empty() => self.activate_source(source, tracks, 0),
+                    Ok(_) => self.playlists.error = Some(tr(K::NoTracks).into()),
+                    Err(error) => self.playlists.error = Some(error),
+                }
+            }
+            Ev::PlaylistDone(..) => {}
             Ev::Url(key, q, r) => self.on_url(key, q, r),
             Ev::Mpv(v) => self.mpv_event(&v),
         }
@@ -624,7 +694,17 @@ impl App {
         } else if v == View::Player {
             let _ = execute!(o, Show, LeaveAlternateScreen);
         }
+        self.hover = None;
         self.view = v;
+        if v == View::Queue {
+            self.reconcile_filter();
+        }
+        if v == View::Playlists && !self.playlists.loaded && !self.playlists.loading {
+            self.refresh_playlists();
+        }
+        if v == View::Search && self.search.tracks.is_empty() && !self.search.loading {
+            self.search.input.editing = true;
+        }
         self.frame.clear();
         self.line.clear();
         self.dirty = true;
@@ -636,21 +716,40 @@ impl App {
     }
 
     fn queue_key(&mut self, code: KeyCode, mods: KeyModifiers) {
-        let last = self.tracks.len().saturating_sub(1);
+        if self.queue_filter.editing {
+            self.queue_filter.key(code, mods);
+            self.reconcile_filter();
+            return;
+        }
+        let visible = self.visible_tracks();
+        let last = visible.len().saturating_sub(1);
+        let position = visible.iter().position(|&i| i == self.sel).unwrap_or(0);
         let page = term_size().1.saturating_sub(3).max(1);
+        let choose = |app: &mut Self, to: usize| {
+            if let Some(&i) = visible.get(to.min(last)) {
+                app.move_sel(i);
+            }
+        };
         match code {
+            KeyCode::Esc if !self.queue_filter.text.is_empty() => {
+                self.queue_filter.text.clear();
+                self.reconcile_filter();
+            }
             KeyCode::Char('l') | KeyCode::Char('q') | KeyCode::Esc => self.set_view(View::Player),
-            KeyCode::Tab | KeyCode::Char(',') => self.set_view(View::Settings),
-            KeyCode::Up | KeyCode::Char('k') => self.move_sel(self.sel.saturating_sub(1)),
-            KeyCode::Down | KeyCode::Char('j') => self.move_sel(self.sel + 1),
-            KeyCode::PageUp => self.move_sel(self.sel.saturating_sub(page)),
-            KeyCode::PageDown => self.move_sel(self.sel + page),
-            KeyCode::Home | KeyCode::Char('g') => self.move_sel(0),
-            KeyCode::End | KeyCode::Char('G') => self.move_sel(last),
-            KeyCode::Enter => {
+            KeyCode::Char(',') => self.set_view(View::Settings),
+            KeyCode::Char('/') => self.queue_filter.editing = true,
+            KeyCode::Char('?') => self.set_view(View::Search),
+            KeyCode::Up | KeyCode::Char('k') => choose(self, position.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => choose(self, position + 1),
+            KeyCode::PageUp => choose(self, position.saturating_sub(page)),
+            KeyCode::PageDown => choose(self, position + page),
+            KeyCode::Home | KeyCode::Char('g') => choose(self, 0),
+            KeyCode::End | KeyCode::Char('G') => choose(self, last),
+            KeyCode::Enter if !visible.is_empty() => {
                 self.back = false;
                 self.go(self.sel)
             }
+            KeyCode::Enter => {}
             // Space, n, b, s, ←/→ and +/- control playback from here too.
             _ => self.play_key(code, mods),
         }
@@ -659,7 +758,6 @@ impl App {
     fn settings_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         match code {
             KeyCode::Char('l') | KeyCode::Char('q') | KeyCode::Char(',') | KeyCode::Esc => self.set_view(View::Player),
-            KeyCode::Tab => self.set_view(View::Queue),
             KeyCode::Up | KeyCode::Char('k') => self.set_sel = self.set_sel.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => self.set_sel = (self.set_sel + 1).min(SETTINGS),
             KeyCode::Enter if self.set_sel == SETTINGS => self.check_for_updates(),
@@ -678,8 +776,30 @@ impl App {
     }
 
     fn key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+            self.quit = true;
+            return;
+        }
+        if code == KeyCode::Char('f') && mods.contains(KeyModifiers::CONTROL) {
+            self.set_view(View::Search);
+            self.search.input.editing = true;
+            return;
+        }
+        if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
+            let views = [View::Queue, View::Search, View::Playlists, View::Settings];
+            let index = views.iter().position(|&v| v == self.view).unwrap_or(3);
+            let step = if code == KeyCode::BackTab || mods.contains(KeyModifiers::SHIFT) {
+                3
+            } else {
+                1
+            };
+            self.set_view(views[(index + step) % views.len()]);
+            return;
+        }
         match self.view {
             View::Queue => self.queue_key(code, mods),
+            View::Search => self.search_key(code, mods),
+            View::Playlists => self.playlists_key(code, mods),
             View::Settings => self.settings_key(code, mods),
             View::Player => self.play_key(code, mods),
         }
@@ -688,7 +808,8 @@ impl App {
     fn play_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let seek = self.cfg.settings.seek as i64;
         match code {
-            KeyCode::Char('l') | KeyCode::Tab => self.set_view(View::Queue),
+            KeyCode::Char('l') => self.set_view(View::Queue),
+            KeyCode::Char('?') => self.set_view(View::Search),
             KeyCode::Char(',') => self.set_view(View::Settings),
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.quit = true,
@@ -918,36 +1039,60 @@ impl App {
     }
 
     fn tabs(&self, w: usize) -> String {
-        let first = clip(&format!(" {} ", tr(K::TabQueue)), w);
-        let separator = if width(&first) < w { " " } else { "" };
-        let second = clip(
-            &format!(" {} ", tr(K::TabSettings)),
-            w.saturating_sub(width(&first) + separator.len()),
-        );
-        let tab = |label: String, on: bool| if on { reverse(&label) } else { label };
-        format!(
-            "{}{separator}{}",
-            tab(first, self.view == View::Queue),
-            tab(second, self.view == View::Settings)
-        )
+        let tabs = [
+            (K::TabQueue, View::Queue),
+            (K::TabSearch, View::Search),
+            (K::TabPlaylists, View::Playlists),
+            (K::TabSettings, View::Settings),
+        ];
+        let needed = tabs.iter().map(|(key, _)| width(tr(*key)) + 2).sum::<usize>() + tabs.len() - 1;
+        // When all tabs cannot fit, start at the active tab so it remains visible.
+        let start = if needed > w {
+            tabs.iter().position(|(_, view)| *view == self.view).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut out = String::new();
+        let mut remaining = w;
+        for (index, (key, view)) in tabs.into_iter().skip(start).enumerate() {
+            if index > 0 && remaining > 0 {
+                out.push(' ');
+                remaining -= 1;
+            }
+            let label = clip(&format!(" {} ", tr(key)), remaining);
+            remaining = remaining.saturating_sub(width(&label));
+            out.push_str(&if self.view == view { reverse(&label) } else { label });
+        }
+        out
     }
 
     fn queue_rows(&mut self, w: usize, rows: usize, out: &mut Vec<String>) {
-        let hint = tr(K::Queue)
-            .replace("{n}", &self.tracks.len().to_string())
-            .replace("{more}", if self.list_done { "" } else { tr(K::More) });
+        let visible = self.visible_tracks();
+        let hint = if self.queue_filter.editing || !self.queue_filter.text.is_empty() {
+            tr(if self.queue_filter.editing {
+                K::FilterTyping
+            } else {
+                K::FilterActive
+            })
+            .replace("{q}", &self.queue_filter.text)
+            .replace("{n}", &visible.len().to_string())
+            .replace("{total}", &self.tracks.len().to_string())
+        } else {
+            tr(K::Queue)
+                .replace("{n}", &self.tracks.len().to_string())
+                .replace("{more}", if self.list_done { "" } else { tr(K::More) })
+        };
         out.push(clip(&hint, w));
-        // Scroll only when the cursor reaches an edge: fewer rows change per key press.
-        if self.sel < self.top {
-            self.top = self.sel;
-        } else if self.sel >= self.top + rows {
-            self.top = self.sel + 1 - rows;
-        }
-        self.top = self.top.min(self.tracks.len().saturating_sub(rows));
-        for (i, t) in self.tracks.iter().enumerate().skip(self.top).take(rows) {
+        let selected = visible.iter().position(|&i| i == self.sel).unwrap_or(0);
+        browser::scroll(&mut self.top, selected, visible.len(), rows);
+        for &i in visible.iter().skip(self.top).take(rows) {
+            let t = &self.tracks[i];
             let mark = if i == self.cur { "▶" } else { " " };
             let row = clip(&format!(" {mark} {}", t.title), w);
             out.push(if i == self.sel { reverse(&row) } else { row });
+        }
+        if visible.is_empty() && rows > 0 {
+            out.push(clip(tr(K::NoMatches), w));
         }
     }
 
@@ -998,6 +1143,8 @@ impl App {
             let rows = h.saturating_sub(3);
             match self.view {
                 View::Settings => self.settings_rows(w, rows, &mut out),
+                View::Search => self.search_rows(w, rows, &mut out),
+                View::Playlists => self.playlists_rows(w, rows, &mut out),
                 _ => self.queue_rows(w, rows, &mut out),
             }
         }
@@ -1086,7 +1233,14 @@ pub fn run(source: String, cfg: Config, looping: bool, shuffle_on: bool, resume:
         }
     }
     let have_cache = cached.is_some();
-    spawn_list(api.clone(), source.clone(), cfg.token.clone(), have_cache, tx.clone());
+    spawn_list(
+        api.clone(),
+        source.clone(),
+        cfg.token.clone(),
+        have_cache,
+        0,
+        tx.clone(),
+    );
 
     let mpv = Mpv::start(&cfg.settings, tx.clone())?;
     let repeat = if looping { Repeat::All } else { cfg.settings.repeat };
@@ -1382,10 +1536,93 @@ mod tests {
 
     #[test]
     #[ignore = "requires mpv"]
+    fn browser_filter_uses_source_indices_and_does_not_steal_typing_keys() {
+        let (mut app, _rx, _) = app_with(&[]);
+        app.view = View::Queue;
+        app.tracks[0].title = "First".into();
+        app.tracks[1].title = "日本 second".into();
+        app.key(KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "日本".chars() {
+            app.key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(app.visible_tracks(), vec![1]);
+        assert_eq!(app.sel, 1);
+        assert_eq!(app.cur, 0);
+        app.key(KeyCode::Enter, KeyModifiers::NONE); // finish editing, keep playback
+        assert_eq!(app.cur, 0);
+        let url = app.tracks[1].url.clone();
+        app.urls.insert(url, ("http://127.0.0.1/unused".into(), Instant::now()));
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.cur, 1);
+        app.key(KeyCode::Char('/'), KeyModifiers::NONE);
+        app.key(KeyCode::Char('q'), KeyModifiers::NONE);
+        app.key(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!app.quit);
+        assert_eq!(app.cur, 1);
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.visible_tracks().is_empty());
+        let paused = app.paused;
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.paused, paused);
+        app.key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.visible_tracks(), vec![0, 1]);
+    }
+
+    #[test]
+    #[ignore = "requires mpv"]
+    fn browser_results_are_inert_until_selected_and_old_listings_cannot_leak() {
+        let (mut app, _rx, _) = app_with(&[]);
+        app.view = View::Search;
+        app.browse_epoch.store(2, Ordering::Relaxed);
+        app.search.loading = true;
+        app.handle(Ev::SearchDone(1, "old".into(), Ok(vec![])));
+        assert!(app.search.loading);
+        let results = app.tracks.clone();
+        app.handle(Ev::SearchDone(2, "new".into(), Ok(results.clone())));
+        assert_eq!(app.cur, 0);
+        assert_eq!(app.source, "test");
+        app.urls.insert(
+            results[1].url.clone(),
+            ("http://127.0.0.1/unused".into(), Instant::now()),
+        );
+        app.activate_source("scsearch25:new".into(), results, 1);
+        assert_eq!(app.cur, 1);
+        assert_eq!(app.source, "scsearch25:new");
+        app.handle(Ev::Tracks(0, vec![track("https://soundcloud.com/old/track", 60)]));
+        app.handle(Ev::Replace(0, vec![]));
+        app.handle(Ev::ListDone(0, Some("old error".into())));
+        assert_eq!(app.tracks.len(), 2);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    #[ignore = "requires mpv"]
+    fn browser_shortcuts_survive_remote_errors_and_tabs_cycle_in_both_directions() {
+        let (mut app, _rx, _) = app_with(&[]);
+        app.cfg
+            .aliases
+            .insert("gym".into(), "https://soundcloud.com/u/sets/gym".into());
+        app.view = View::Queue;
+        app.key(KeyCode::Tab, KeyModifiers::NONE);
+        assert!(app.view == View::Search);
+        app.key(KeyCode::Tab, KeyModifiers::NONE);
+        assert!(app.view == View::Playlists);
+        assert_eq!(app.playlists.items.len(), 1);
+        app.handle(Ev::PlaylistsDone(Err("offline".into())));
+        assert_eq!(app.playlists.items.len(), 1);
+        app.key(KeyCode::Tab, KeyModifiers::NONE);
+        assert!(app.view == View::Settings);
+        app.key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert!(app.view == View::Playlists);
+        assert_eq!(app.cur, 0);
+    }
+
+    #[test]
+    #[ignore = "requires mpv"]
     fn panels_fit_tiny_terminals_and_recover_after_resizing() {
         let (mut app, _rx, _) = app_with(&[]);
         // Widths reserve the final terminal column; heights include the status row.
-        for view in [View::Queue, View::Settings] {
+        for view in [View::Queue, View::Search, View::Playlists, View::Settings] {
             app.view = view;
             app.sel = app.tracks.len() - 1;
             app.set_sel = SETTINGS;
@@ -1394,6 +1631,15 @@ mod tests {
                     let rows = app.panel_rows(w, h, "status");
                     assert_eq!(rows.len(), h);
                     assert_eq!(rows.last().unwrap(), &clip("status", w));
+                    let key = match view {
+                        View::Queue => K::TabQueue,
+                        View::Search => K::TabSearch,
+                        View::Playlists => K::TabPlaylists,
+                        _ => K::TabSettings,
+                    };
+                    if h >= 2 && w >= width(tr(key)) + 2 {
+                        assert!(rows[0].contains(&reverse(&format!(" {} ", tr(key)))));
+                    }
                     for row in &rows {
                         let plain = row.replace("\x1b[7m", "").replace("\x1b[0m", "");
                         assert!(width(&plain) <= w, "row exceeds {w} columns: {row:?}");
