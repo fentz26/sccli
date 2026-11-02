@@ -7,9 +7,8 @@ use crate::{
 };
 #[cfg(any(windows, test))]
 mod cancel_io;
-mod process;
 pub mod requests;
-use process::Child;
+use crate::process::Child;
 
 use anyhow::{Context, Result};
 use requests::{self as net, ApiError, Cancel, Gate, Seen, Step};

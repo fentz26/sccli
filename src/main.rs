@@ -6,6 +6,7 @@ mod app;
 mod config;
 mod log;
 mod player;
+mod process;
 mod ui;
 
 use anyhow::{Context, Result, bail};

@@ -1,4 +1,4 @@
-//! Own an extractor and the process tree it starts, including inherited pipe holders.
+//! Own a child process and its descendants, with OS cleanup on Windows parent exit.
 
 use std::{
     io,
@@ -70,7 +70,7 @@ impl DerefMut for Child {
 
 impl Drop for Child {
     fn drop(&mut self) {
-        // A successful extractor can also leave descendants holding its pipes open.
+        // A successful child can also leave descendants holding its pipes open.
         let _ = self.kill();
         let _ = self.inner.wait();
     }
@@ -160,7 +160,7 @@ mod windows {
         }
         Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "extractor primary thread was not found",
+            "child primary thread was not found",
         ))
     }
 }
