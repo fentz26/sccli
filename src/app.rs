@@ -951,22 +951,23 @@ impl App {
         }
     }
 
-    fn settings_rows(&self, w: usize, out: &mut Vec<String>) {
+    fn settings_rows(&self, w: usize, rows: usize, out: &mut Vec<String>) {
+        let mut lines = Vec::new();
         out.push(clip(tr(K::SettingsHint), w));
         let names: Vec<_> = (0..SETTINGS).map(|i| self.setting_row(i)).collect();
         let col = names.iter().map(|n| width(n.0)).max().unwrap_or(0);
         for (i, (name, value)) in names.iter().enumerate() {
             let pad = " ".repeat(col - width(name));
             let row = clip(&format!("   {name}{pad}   ‹ {value} ›"), w);
-            out.push(if i == self.set_sel { reverse(&row) } else { row });
+            lines.push(if i == self.set_sel { reverse(&row) } else { row });
         }
-        out.push(String::new());
-        out.push(clip(&format!(" {}", tr(K::About)), w));
-        out.push(clip(
+        lines.push(String::new());
+        lines.push(clip(&format!(" {}", tr(K::About)), w));
+        lines.push(clip(
             &format!("   scc {} · © 2026 Fentz · MIT License", crate::VERSION),
             w,
         ));
-        out.push(clip("   https://github.com/fentz26/sccli", w));
+        lines.push(clip("   https://github.com/fentz26/sccli", w));
         let result = match &self.update {
             UpdateCheck::NotRun => String::new(),
             UpdateCheck::Running => tr(K::Checking).to_string(),
@@ -977,7 +978,18 @@ impl App {
         let name = tr(K::CheckUpdates);
         let pad = " ".repeat(col.saturating_sub(width(name)));
         let row = clip(&format!("   {name}{pad}   {result}"), w);
-        out.push(if self.set_sel == SETTINGS { reverse(&row) } else { row });
+        lines.push(if self.set_sel == SETTINGS { reverse(&row) } else { row });
+        // About rows sit between the last setting and the update action. Keep the
+        // selected action visible even when only a few body rows fit on screen.
+        let selected = if self.set_sel == SETTINGS {
+            lines.len() - 1
+        } else {
+            self.set_sel
+        };
+        let top = selected
+            .saturating_sub(rows.saturating_sub(1))
+            .min(lines.len().saturating_sub(rows));
+        out.extend(lines.into_iter().skip(top).take(rows));
     }
 
     /// Writes only what changed, in one go. Nothing at all is written when nothing changed:
@@ -1012,7 +1024,7 @@ impl App {
             let rows = h - 3;
             let mut out = vec![self.tabs()];
             match self.view {
-                View::Settings => self.settings_rows(w, &mut out),
+                View::Settings => self.settings_rows(w, rows, &mut out),
                 _ => self.queue_rows(w, rows, &mut out),
             }
             out.resize(h - 1, String::new());
@@ -1359,6 +1371,32 @@ mod tests {
         let mut app = App::new(Arc::new(api), cfg, tx, mpv, "test".into(), Repeat::Off, tracks, None);
         app.list_done = true;
         (app, rx, m)
+    }
+
+    #[test]
+    #[ignore = "requires mpv"]
+    fn settings_selection_stays_visible_in_short_terminals() {
+        let (mut app, _rx, _) = app_with(&[]);
+        for rows in [2, 7, 25] {
+            for selected in (0..=SETTINGS).chain((0..=SETTINGS).rev()) {
+                app.set_sel = selected;
+                let mut rendered = Vec::new();
+                app.settings_rows(39, rows, &mut rendered);
+                assert!(rendered.len() <= rows + 1); // hint plus body
+                let highlighted: Vec<_> = rendered.iter().filter(|row| row.starts_with("\x1b[7m")).collect();
+                assert_eq!(highlighted.len(), 1, "selection {selected}, body height {rows}");
+                let expected = if selected == SETTINGS {
+                    tr(K::CheckUpdates)
+                } else {
+                    app.setting_row(selected).0
+                };
+                assert!(highlighted[0].contains(expected));
+            }
+        }
+        let mut rendered = Vec::new();
+        app.settings_rows(99, 25, &mut rendered);
+        assert!(rendered.iter().any(|row| row.contains("MIT License")));
+        assert!(rendered.iter().any(|row| row.contains("github.com/fentz26/sccli")));
     }
 
     fn connect(app: &mut App, rx: &mpsc::Receiver<Ev>) {
