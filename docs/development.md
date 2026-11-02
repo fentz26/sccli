@@ -33,3 +33,8 @@ cargo about generate --locked --config .cargo/about.toml .cargo/about.hbs -o THI
 ```
 
 Regenerate `THIRD_PARTY_LICENSES.md` whenever dependencies change. CI fails if it is out of date.
+
+## Network measurements
+
+[Network testing](network-testing.md) describes the paced HTTP/mpv regression tests,
+recorded measurements, and the packet-loss checks that remain outstanding.
