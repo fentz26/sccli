@@ -3,11 +3,12 @@
 ```text
 src/main.rs          Command-line entry point
 src/app.rs           Event loop, queue, keyboard input and rendering
+src/app/browse.rs    In-app search, playlist loading and source selection
 src/config.rs        Settings and saved state
 src/log.rs           Redacted diagnostic logging
 src/api/             SoundCloud API client and request control
 src/player/          mpv process, IPC and playback state
-src/ui/              Interface text and translations
+src/ui/              Interface text, translations and browser input state
 docs/                User and contributor documentation
 debian/, packaging/  Ubuntu package
 .cargo/              Build, dependency-check and license configuration

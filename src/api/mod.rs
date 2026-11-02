@@ -15,6 +15,7 @@ use requests::{self as net, ApiError, Cancel, Gate, Seen, Step};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     io::{BufRead, BufReader, Read, Write},
     process::{Command, ExitStatus, Stdio},
     sync::{
@@ -63,6 +64,12 @@ pub struct Track {
     /// Only encrypted (DRM) streams exist, which scc does not play.
     #[serde(default)]
     pub protected: bool,
+}
+
+#[derive(Clone)]
+pub struct Playlist {
+    pub title: String,
+    pub url: String,
 }
 
 pub struct Reply {
@@ -687,6 +694,58 @@ impl Api {
             return Err(ApiError::Cancelled);
         }
         Ok(result.unwrap_or_else(|| source.to_string()))
+    }
+
+    pub fn search(&self, query: &str, cancel: &Cancel) -> Result<Vec<Track>, ApiError> {
+        let v = self.fetch(&format!("{API}/search/tracks?q={}&limit=25", encode(query)), cancel)?;
+        Ok(v["collection"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(parse_track)
+            .collect())
+    }
+
+    /// Owned and liked playlists. Share tokens remain part of the playable URL.
+    pub fn playlists(&self, user: &str) -> Result<Vec<Playlist>> {
+        let id = self.resolve(&format!("https://soundcloud.com/{user}"))?["id"]
+            .as_u64()
+            .context("user not found")?;
+        let mut lists = Vec::new();
+        let mut seen = HashSet::new();
+        for path in ["playlists", "playlist_likes"] {
+            let mut next = Some(format!("{API}/users/{id}/{path}?limit={PAGE}&linked_partitioning=1"));
+            let mut pages = HashSet::new();
+            while let Some(url) = next {
+                anyhow::ensure!(
+                    url.starts_with(&format!("{API}/")) && pages.insert(url.clone()),
+                    "invalid playlist page"
+                );
+                let page = self.get(&url)?;
+                for item in page["collection"].as_array().into_iter().flatten() {
+                    let item = if item["playlist"].is_object() {
+                        &item["playlist"]
+                    } else {
+                        item
+                    };
+                    let (Some(title), Some(url)) = (item["title"].as_str(), item["permalink_url"].as_str()) else {
+                        continue;
+                    };
+                    let url = match item["secret_token"].as_str().filter(|s| s.starts_with("s-")) {
+                        Some(secret) if !url.ends_with(secret) => format!("{}/{secret}", url.trim_end_matches('/')),
+                        _ => url.to_owned(),
+                    };
+                    if seen.insert(url.clone()) {
+                        lists.push(Playlist {
+                            title: clean(title),
+                            url,
+                        });
+                    }
+                }
+                next = page["next_href"].as_str().map(str::to_owned);
+            }
+        }
+        Ok(lists)
     }
 
     /// Lists a source page by page. Ok(false): not something the API path handles, use yt-dlp.
@@ -1469,6 +1528,49 @@ mod tests {
             "duration": 61_000,
             "media": { "transcodings": transcodings },
         })
+    }
+
+    #[test]
+    fn browser_search_encodes_queries_and_parses_tracks() {
+        let body = json!({"collection": [track(vec![])]}).to_string();
+        let (api, mock, _) = mock::api(vec![ok(&body)], None);
+        let tracks = api.search("Björk & 日本", &Cancel::never()).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "artist — song");
+        let calls = mock.calls.lock().unwrap();
+        assert!(calls[0].0.contains(&format!("q={}", encode("Björk & 日本"))));
+    }
+
+    #[test]
+    fn browser_playlists_paginate_merge_likes_and_preserve_share_urls() {
+        let own = json!({"title":"Own", "permalink_url":"https://soundcloud.com/u/sets/own"});
+        let private = json!({"title":"Private", "permalink_url":"https://soundcloud.com/u/sets/private", "secret_token":"s-hidden"});
+        let script = vec![
+            ok(r#"{"id":7}"#),
+            ok(&json!({"collection":[own.clone()], "next_href":format!("{API}/users/7/playlists?offset=1")}).to_string()),
+            ok(&json!({"collection":[private]}).to_string()),
+            ok(&json!({"collection":[{"playlist":own}, {"playlist":{"title":"Liked", "permalink_url":"https://soundcloud.com/v/sets/liked"}}]}).to_string()),
+        ];
+        let (api, mock, _) = mock::api(script, Some("test-token"));
+        let lists = api.playlists("u").unwrap();
+        assert_eq!(lists.len(), 3);
+        assert!(lists[1].url.ends_with("/s-hidden"));
+        let calls = mock.calls.lock().unwrap();
+        assert!(calls.iter().all(|(_, token)| token.as_deref() == Some("test-token")));
+        assert!(calls[3].0.contains("/users/7/playlist_likes?"));
+    }
+
+    #[test]
+    fn browser_playlists_refuse_foreign_pagination_without_sending_credentials() {
+        let (api, mock, _) = mock::api(
+            vec![
+                ok(r#"{"id":7}"#),
+                ok(r#"{"collection":[],"next_href":"https://other.test/steal"}"#),
+            ],
+            Some("test-token"),
+        );
+        assert!(api.playlists("u").is_err());
+        assert_eq!(mock.calls.lock().unwrap().len(), 2);
     }
 
     #[test]

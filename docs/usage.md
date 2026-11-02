@@ -52,12 +52,38 @@ n  b        next / previous
 s           stop
 l           queue
 ,           settings
-tab         switch between Queue and Settings
+tab         next tab: Queue → Search → Playlists → Settings
+Shift-Tab   previous tab
+/           filter the queue; edit the query in Search
+Ctrl-F, ?   open SoundCloud search
 q           quit or close view
 Ctrl-C      quit
 ```
 
 In the queue, `PgUp`, `PgDn`, `g` and `G` jump through the list.
+
+## Search and playlists
+
+In Queue, press `/` and type to filter track titles and artist names. Matching ignores
+letter case and accepts multiple words in any order. Enter keeps the filter; a second
+Enter plays the selected matching track. Escape clears the filter. Filtering changes
+only the displayed rows, so next/previous still follow the full playback queue.
+
+Ctrl-F opens Search. Type a SoundCloud query and press Enter, then select a result
+with Up/Down and press Enter to play. Selecting a result replaces the queue with those
+results, starting at the chosen track. Browsing and searching leave the current song
+playing. `/` edits the query, Ctrl-U clears it, and Escape cancels editing.
+
+The Playlists tab combines saved `scc alias` shortcuts with your signed-in account's
+owned and liked SoundCloud playlists. Enter opens the selected playlist as the new
+queue, starting at its first track; playback continues while it loads. `r` refreshes
+the library. Saved shortcuts also work signed out and remain available if SoundCloud
+cannot load. Use `scc alias <name> <url>` to save a shortcut. Shortcuts using `/you/`
+require login. There is no playlist creation or remote editing in this tab.
+
+All tabs reserve the status line when resized; narrow windows keep the active tab
+visible. While editing a filter or query, letters such as `q`, `n` and spaces are text;
+finish or cancel editing before using playback shortcuts. Ctrl-C always quits.
 
 ## Language
 
