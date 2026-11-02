@@ -38,6 +38,33 @@ cargo test --locked settings_selection_stays_visible_in_short_terminals -- --ign
 This test uses the existing App fixture, which requires mpv. CI runs it with the
 other ignored integration tests on Linux, macOS and Windows.
 
+## Very small terminal sizes
+
+Further Pi checks found that a terminal shorter than five rows was treated as
+24 rows high. This could hide the selected Settings action despite the scrolling
+fix above. The tab bar also did not clip its labels before applying selection
+styling, allowing writes beyond very narrow widths.
+
+The layout now uses the reported nonzero height and clips each tab label to the
+remaining width before styling. Four rows fit tabs, hint, selected body row and
+status. Three rows keep tabs, hint and status; two keep tabs and status; one
+keeps only status. Queue navigation uses saturating height arithmetic when there
+is no body space. Expanding restores the full layout and selection.
+
+The normal executable was rebuilt and checked over SSH/tmux on the Pi at 40×4,
+40×3, 40×2, 40×1 and 8×5, then restored to 100×28. Japanese Settings labels and a
+live public track were used with volume zero. The selected update action remained
+visible at 40×4; status remained visible at each smaller height; the full About
+section and selected action returned at 100×28. Normal quit exited with status zero.
+
+The regression covers both panels at heights 1 through 6 followed by 28, with
+usable widths 0, 3, 7, 19 and 99. It checks row count, displayed width, the final
+status row and Settings selection whenever there is room:
+
+```sh
+cargo test --locked panels_fit_tiny_terminals_and_recover_after_resizing -- --ignored
+```
+
 ## Windows abrupt parent termination
 
 A real Windows CI run at regression commit `d695b53` reproduced an orphaned player:
