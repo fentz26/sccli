@@ -69,8 +69,18 @@ scc watches playback and recovers by itself. It gets a fresh link and continues 
 song stopped, up to five times over about 30 seconds. If that does not work, it stays on the song
 and shows why. Press `enter` to try again from the same place, or `n` to move on.
 
+This hold is intentional, including during unattended playback: a broken stream can stop
+the queue, but recovery exhaustion never silently advances past a song. There is no timed
+auto-skip setting. Connection loss also always holds the place.
+
 A song SoundCloud says you cannot play, such as a removed or DRM protected one, is skipped with a
-short note.
+note that stays visible for 30 seconds, unless another notice replaces it.
+
+When you choose a different song, queued requests and retry waits are cancelled. Active
+HTTP response waits and reads for the old song are interrupted too. On Windows these
+reads check cancellation between short waits. DNS lookup, an initial TCP connection and
+blocked writes still rely on the request timeout. Cancellable lookups use a private connection
+pool so stopping one cannot interrupt the next song or a playlist request.
 
 ## Troubleshooting
 
@@ -81,9 +91,11 @@ to attach to a bug report.
 ## Known limitations
 
 Recovery is tested against real mpv with a local server that fails on demand, and SoundCloud
-responses are simulated. These have not been tested:
+responses are simulated. Live spot checks confirmed that invalid client IDs and invalid
+OAuth tokens receive HTTP 401. These have not been tested:
 
-- Real 401, 403 and 429 responses from SoundCloud.
+- Expired OAuth tokens, a formerly valid client ID expiring mid-session, blocked-track 403
+  responses and real 429 rate limits from SoundCloud.
 - Packet loss and slow connections. Buffer sizes stay as they are until these are measured.
 - `/s-...` private share links. Private tracks in your likes do play while signed in.
 - The on-screen player on Linux and Windows.

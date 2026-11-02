@@ -5,6 +5,8 @@ use crate::{
     config::{self, Quality},
     log,
 };
+#[cfg(any(windows, test))]
+mod cancel_io;
 mod process;
 pub mod requests;
 use process::Child;
@@ -78,11 +80,58 @@ pub enum Failure {
 /// The HTTP layer, separate so every failure can be replayed in tests.
 pub trait Transport: Send + Sync {
     fn get(&self, url: &str, oauth: Option<&str>, timeout: Duration) -> Result<Reply, Failure>;
+    fn get_cancellable(
+        &self,
+        url: &str,
+        oauth: Option<&str>,
+        timeout: Duration,
+        _cancel: &Cancel,
+    ) -> Result<Reply, Failure> {
+        self.get(url, oauth, timeout)
+    }
     /// Where a link ends up after redirects.
     fn final_url(&self, url: &str, timeout: Duration) -> Option<String>;
+    fn final_url_cancellable(&self, url: &str, timeout: Duration, _cancel: &Cancel) -> Option<String> {
+        self.final_url(url, timeout)
+    }
 }
 
 struct Ureq(ureq::Agent);
+
+impl Ureq {
+    fn with_cancel<T>(&self, cancel: &Cancel, work: impl FnOnce(&ureq::Agent) -> T) -> T {
+        if !cancel.can_cancel() {
+            return work(&self.0);
+        }
+        // Agent clones share shutdown state. A fresh agent isolates this lookup
+        // from API listings and from stream requests for the newly selected song.
+        #[cfg(not(windows))]
+        let agent: ureq::Agent = self.0.config().clone().into();
+        #[cfg(windows)]
+        let agent = cancel_io::agent(self.0.config().clone(), cancel.clone());
+        thread::scope(|scope| {
+            let (done, wait) = mpsc::channel::<()>();
+            let mut active = Some(agent.clone());
+            scope.spawn(move || {
+                loop {
+                    if cancel.is_stale() {
+                        if let Some(active) = active.take() {
+                            active.shutdown();
+                        }
+                    }
+                    match wait.recv_timeout(Duration::from_millis(50)) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        _ => return,
+                    }
+                }
+            });
+            // Dropping the sender also stops the watcher if work unwinds.
+            let result = work(&agent);
+            drop(done);
+            result
+        })
+    }
+}
 
 fn failure(e: ureq::Error) -> Failure {
     match e {
@@ -121,6 +170,16 @@ impl Transport for Ureq {
         })
     }
 
+    fn get_cancellable(
+        &self,
+        url: &str,
+        oauth: Option<&str>,
+        timeout: Duration,
+        cancel: &Cancel,
+    ) -> Result<Reply, Failure> {
+        self.with_cancel(cancel, |agent| Ureq(agent.clone()).get(url, oauth, timeout))
+    }
+
     fn final_url(&self, url: &str, timeout: Duration) -> Option<String> {
         let res = self
             .0
@@ -132,6 +191,9 @@ impl Transport for Ureq {
             .call()
             .ok()?;
         Some(res.get_uri().to_string())
+    }
+    fn final_url_cancellable(&self, url: &str, timeout: Duration, cancel: &Cancel) -> Option<String> {
+        self.with_cancel(cancel, |agent| Ureq(agent.clone()).final_url(url, timeout))
     }
 }
 
@@ -290,7 +352,11 @@ impl Api {
     fn plain_until(&self, url: &str, deadline: Instant, cancel: &Cancel) -> Result<Reply, ApiError> {
         let _permit = self.gate.enter(deadline, cancel)?;
         let timeout = net::remaining(deadline, cancel)?.min(net::ATTEMPT_TIMEOUT);
-        self.http.get(url, None, timeout).map_err(|e| match e {
+        let reply = self.http.get_cancellable(url, None, timeout, cancel);
+        if cancel.is_stale() {
+            return Err(ApiError::Cancelled);
+        }
+        reply.map_err(|e| match e {
             Failure::Timeout => ApiError::Timeout,
             Failure::Network => ApiError::Network,
         })
@@ -431,8 +497,11 @@ impl Api {
             let reply = {
                 let _permit = self.gate.enter(deadline, cancel)?;
                 let timeout = net::remaining(deadline, cancel)?.min(net::ATTEMPT_TIMEOUT);
-                self.http.get(&full, self.token.as_deref(), timeout)
+                self.http.get_cancellable(&full, self.token.as_deref(), timeout, cancel)
             };
+            if cancel.is_stale() {
+                return Err(ApiError::Cancelled);
+            }
             let latency_ms = started.elapsed().as_millis() as u64;
             let wait = match reply {
                 Ok(r) => {
@@ -614,10 +683,11 @@ impl Api {
     fn expand_until(&self, source: &str, deadline: Instant, cancel: &Cancel) -> Result<String, ApiError> {
         let _permit = self.gate.enter(deadline, cancel)?;
         let timeout = net::remaining(deadline, cancel)?.min(net::ATTEMPT_TIMEOUT);
-        Ok(self
-            .http
-            .final_url(source, timeout)
-            .unwrap_or_else(|| source.to_string()))
+        let result = self.http.final_url_cancellable(source, timeout, cancel);
+        if cancel.is_stale() {
+            return Err(ApiError::Cancelled);
+        }
+        Ok(result.unwrap_or_else(|| source.to_string()))
     }
 
     /// Lists a source page by page. Ok(false): not something the API path handles, use yt-dlp.
@@ -722,7 +792,7 @@ impl Api {
             let url = format!("{API}/tracks/{}", t.id);
             self.fetch(&with_query(&url, &[("secret_token", t.secret.as_deref())]), cancel)?
         } else {
-            self.resolve(&t.url)?
+            self.fetch(&format!("{API}/resolve?url={}", encode(&t.url)), cancel)?
         };
         let fresh = parse_track(&fresh).ok_or(ApiError::Invalid)?;
         if fresh.protected {
@@ -1082,6 +1152,99 @@ pub mod mock {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    pub(super) fn accept_test_connection(listener: &std::net::TcpListener) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((socket, _)) => {
+                    socket.set_nonblocking(false).unwrap();
+                    return socket;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("test server did not receive a connection: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_interrupts_active_http_without_shutting_down_other_requests() {
+        use std::net::TcpListener;
+        for mode in 0..3 {
+            eprintln!("testing active cancellation mode {mode}");
+            let partial_body = mode == 1;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let (mut api, _, _) = mock::api(vec![], None);
+            api.http = Box::new(Ureq(
+                ureq::Agent::config_builder()
+                    .proxy(None)
+                    .http_status_as_error(false)
+                    .build()
+                    .into(),
+            ));
+            api.gate = Gate::new(1);
+            let epoch = Arc::new(AtomicU64::new(0));
+            let cancel = Cancel::tied_to(&epoch);
+            thread::scope(|scope| {
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                scope.spawn(move || {
+                    let mut socket = accept_test_connection(&listener);
+                    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut reader = BufReader::new(&mut socket);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    if partial_body {
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{")
+                            .unwrap();
+                    }
+                    ready_tx.send(()).unwrap();
+                    // Hold the connection until the assertion can observe cancellation.
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                });
+                let (result_tx, result_rx) = mpsc::channel();
+                let api = &api;
+                scope.spawn(move || {
+                    let result = if mode == 2 {
+                        api.expand_until(&format!("{base}/slow"), Instant::now() + net::REQUEST_DEADLINE, &cancel)
+                            .map(|_| json!({}))
+                    } else {
+                        api.fetch(&format!("{base}/slow"), &cancel)
+                    };
+                    let _ = result_tx.send(result);
+                });
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                epoch.fetch_add(1, Ordering::Relaxed);
+                let result = result_rx.recv_timeout(Duration::from_secs(1));
+                let _ = release_tx.send(());
+                assert_eq!(result.unwrap(), Err(ApiError::Cancelled));
+            });
+            // Cancelling the private request agent must not poison the shared one.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/ok", listener.local_addr().unwrap());
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    let mut socket = accept_test_connection(&listener);
+                    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut request = [0; 4096];
+                    assert!(socket.read(&mut request).unwrap() > 0);
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                        .unwrap();
+                });
+                assert_eq!(api.get(&url), Ok(json!({})));
+            });
+        }
+    }
 
     #[test]
     fn short_links_pass_the_remaining_budget_to_the_transport() {
