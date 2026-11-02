@@ -154,7 +154,7 @@ fn mmss(s: f64) -> String {
 
 fn term_size() -> (usize, usize) {
     let (w, h) = terminal::size().map_or((80, 24), |s| (s.0 as usize, s.1 as usize));
-    (if w == 0 { 80 } else { w }, if h < 5 { 24 } else { h })
+    (if w == 0 { 80 } else { w }, if h == 0 { 24 } else { h })
 }
 
 fn reverse(s: &str) -> String {
@@ -619,7 +619,7 @@ impl App {
         let mut o = stdout();
         if self.view == View::Player {
             self.sel = self.cur;
-            self.top = self.cur.saturating_sub((term_size().1 - 3) / 2);
+            self.top = self.cur.saturating_sub(term_size().1.saturating_sub(3) / 2);
             let _ = execute!(o, EnterAlternateScreen, Hide);
         } else if v == View::Player {
             let _ = execute!(o, Show, LeaveAlternateScreen);
@@ -917,18 +917,18 @@ impl App {
         )
     }
 
-    fn tabs(&self) -> String {
-        let tab = |k: K, on: bool| {
-            if on {
-                reverse(&format!(" {} ", tr(k)))
-            } else {
-                format!(" {} ", tr(k))
-            }
-        };
+    fn tabs(&self, w: usize) -> String {
+        let first = clip(&format!(" {} ", tr(K::TabQueue)), w);
+        let separator = if width(&first) < w { " " } else { "" };
+        let second = clip(
+            &format!(" {} ", tr(K::TabSettings)),
+            w.saturating_sub(width(&first) + separator.len()),
+        );
+        let tab = |label: String, on: bool| if on { reverse(&label) } else { label };
         format!(
-            "{} {}",
-            tab(K::TabQueue, self.view == View::Queue),
-            tab(K::TabSettings, self.view == View::Settings)
+            "{}{separator}{}",
+            tab(first, self.view == View::Queue),
+            tab(second, self.view == View::Settings)
         )
     }
 
@@ -992,6 +992,20 @@ impl App {
         out.extend(lines.into_iter().skip(top).take(rows));
     }
 
+    fn panel_rows(&mut self, w: usize, h: usize, status: &str) -> Vec<String> {
+        let mut out = vec![self.tabs(w)];
+        if h >= 3 {
+            let rows = h.saturating_sub(3);
+            match self.view {
+                View::Settings => self.settings_rows(w, rows, &mut out),
+                _ => self.queue_rows(w, rows, &mut out),
+            }
+        }
+        out.resize(h.saturating_sub(1), String::new());
+        out.push(clip(status, w));
+        out
+    }
+
     /// Writes only what changed, in one go. Nothing at all is written when nothing changed:
     /// constant repainting is what made the screen flash and fight with the mouse.
     fn render(&mut self) -> Result<()> {
@@ -1021,14 +1035,7 @@ impl App {
                 self.line = line;
             }
         } else {
-            let rows = h - 3;
-            let mut out = vec![self.tabs()];
-            match self.view {
-                View::Settings => self.settings_rows(w, rows, &mut out),
-                _ => self.queue_rows(w, rows, &mut out),
-            }
-            out.resize(h - 1, String::new());
-            out.push(clip(&status, w));
+            let out = self.panel_rows(w, h, &status);
             if self.frame_size != (w, h) {
                 self.frame_size = (w, h);
                 self.frame.clear();
@@ -1371,6 +1378,35 @@ mod tests {
         let mut app = App::new(Arc::new(api), cfg, tx, mpv, "test".into(), Repeat::Off, tracks, None);
         app.list_done = true;
         (app, rx, m)
+    }
+
+    #[test]
+    #[ignore = "requires mpv"]
+    fn panels_fit_tiny_terminals_and_recover_after_resizing() {
+        let (mut app, _rx, _) = app_with(&[]);
+        // Widths reserve the final terminal column; heights include the status row.
+        for view in [View::Queue, View::Settings] {
+            app.view = view;
+            app.sel = app.tracks.len() - 1;
+            app.set_sel = SETTINGS;
+            for h in (1..=6).chain([28]) {
+                for w in [0, 3, 7, 19, 99] {
+                    let rows = app.panel_rows(w, h, "status");
+                    assert_eq!(rows.len(), h);
+                    assert_eq!(rows.last().unwrap(), &clip("status", w));
+                    for row in &rows {
+                        let plain = row.replace("\x1b[7m", "").replace("\x1b[0m", "");
+                        assert!(width(&plain) <= w, "row exceeds {w} columns: {row:?}");
+                    }
+                    if view == View::Settings && h >= 4 && w == 99 {
+                        assert!(
+                            rows.iter()
+                                .any(|row| row.starts_with("\x1b[7m") && row.contains(tr(K::CheckUpdates)))
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
