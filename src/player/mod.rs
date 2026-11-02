@@ -9,11 +9,16 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::mpsc::Sender,
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(windows)]
+use crate::process::Child;
+#[cfg(not(windows))]
+use std::process::Child;
 
 /// How to get a missing program on this system.
 pub fn install_hint(tool: &str) -> String {
@@ -57,7 +62,8 @@ impl Mpv {
     fn start_with(s: &Settings, tx: Sender<Ev>, extra: &[&str]) -> Result<Mpv> {
         let addr = ipc::address();
         let (ahead, back, secs) = s.memory.mpv();
-        let child = Command::new("mpv")
+        let mut command = Command::new("mpv");
+        command
             .args([
                 "--no-video",
                 "--no-terminal",
@@ -82,9 +88,14 @@ impl Mpv {
             .args(extra)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("failed to run mpv ({})", install_hint("mpv")))?;
+            .stderr(Stdio::null());
+        // A terminal close or forced exit can skip Drop. Windows closes our
+        // non-inherited job handle anyway, terminating mpv and its descendants.
+        #[cfg(windows)]
+        let child = Child::spawn(&mut command);
+        #[cfg(not(windows))]
+        let child = command.spawn();
+        let child = child.with_context(|| format!("failed to run mpv ({})", install_hint("mpv")))?;
 
         let path = addr.clone();
         thread::spawn(move || {
