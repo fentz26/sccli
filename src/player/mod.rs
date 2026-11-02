@@ -154,6 +154,94 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    // Run by the parent-death regression as a separate process. Running this
+    // ignored test directly is harmless: only the supervising test supplies a path.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper for the Windows parent-death test"]
+    fn mpv_parent_fixture() {
+        let Some(path) = std::env::var_os("SCC_TEST_MPV_READY") else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut mpv = Mpv::start_silent(&Settings::default(), tx).unwrap();
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(Ev::MpvReady(conn)) => mpv.ready(conn),
+            _ => panic!("fixture mpv did not connect"),
+        }
+        std::fs::write(path, mpv.child.id().to_string()).unwrap();
+        thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs mpv installed"]
+    fn abrupt_parent_exit_stops_mpv() {
+        use std::{
+            os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        use windows_sys::Win32::{
+            Foundation::WAIT_OBJECT_0,
+            System::Threading::{
+                OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+            },
+        };
+        struct Parent(std::process::Child);
+        impl Drop for Parent {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "scc-mpv-parent-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut parent = Parent(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "player::tests::mpv_parent_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("SCC_TEST_MPV_READY", &path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                break text.parse::<u32>().unwrap();
+            }
+            assert!(
+                parent.0.try_wait().unwrap().is_none(),
+                "mpv fixture exited before readiness"
+            );
+            assert!(Instant::now() < deadline, "mpv fixture did not become ready");
+            thread::sleep(Duration::from_millis(20));
+        };
+        let _ = std::fs::remove_file(&path);
+        // Hold this exact process handle before killing the parent, avoiding PID reuse.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+        assert!(!handle.is_null());
+        let mpv = unsafe { OwnedHandle::from_raw_handle(handle) };
+        parent.0.kill().unwrap();
+        parent.0.wait().unwrap();
+        let stopped = unsafe { WaitForSingleObject(mpv.as_raw_handle(), 5000) } == WAIT_OBJECT_0;
+        // A failing regression must not leave an idle player on the CI runner.
+        if !stopped {
+            unsafe { TerminateProcess(mpv.as_raw_handle(), 1) };
+            unsafe { WaitForSingleObject(mpv.as_raw_handle(), 5000) };
+        }
+        assert!(stopped, "mpv survived abrupt parent termination");
+    }
+
     /// A command must reach mpv while the reader is idle. On Windows this fails if a blocking
     /// read holds the pipe, which is the bug `ipc::Reader` exists to prevent.
     #[test]
