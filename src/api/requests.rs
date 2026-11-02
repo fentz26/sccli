@@ -131,6 +131,87 @@ pub fn backoff(attempt: u32, seed: u64) -> Duration {
     Duration::from_millis(ceiling / 2 + x % (ceiling / 2 + 1))
 }
 
+/// Retry-After accepts delay-seconds and all three HTTP-date forms (RFC 9110 §5.6.7).
+pub fn retry_after(value: &str, now: std::time::SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return value.parse().ok().map(Duration::from_secs);
+    }
+    let fields: Vec<_> = value.split_whitespace().collect();
+    let short_day = |day: &str| {
+        matches!(
+            day.trim_end_matches(','),
+            "Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat" | "Sun"
+        )
+    };
+    let (day, month_name, year, clock) = match fields.as_slice() {
+        [weekday, day, month, year, clock, "GMT"] if weekday.ends_with(',') && short_day(weekday) => {
+            (*day, *month, year.parse::<i64>().ok()?, *clock)
+        }
+        [weekday, date, clock, "GMT"]
+            if matches!(
+                *weekday,
+                "Monday," | "Tuesday," | "Wednesday," | "Thursday," | "Friday," | "Saturday," | "Sunday,"
+            ) =>
+        {
+            let parts: Vec<_> = date.split('-').collect();
+            if parts.len() != 3 || parts[2].len() != 2 || !parts[2].bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let short_year: i64 = parts[2].parse().ok()?;
+            let mut today = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_secs()
+                / 86400;
+            let mut current_year = 1970i64;
+            while current_year < 9999 {
+                let leap = current_year % 4 == 0 && (current_year % 100 != 0 || current_year % 400 == 0);
+                let days = if leap { 366 } else { 365 };
+                if today < days {
+                    break;
+                }
+                today -= days;
+                current_year += 1;
+            }
+            let mut year = current_year / 100 * 100 + short_year;
+            if year > current_year + 50 {
+                year -= 100;
+            }
+            (parts[0], parts[1], year, *clock)
+        }
+        [weekday, month, day, clock, year] if short_day(weekday) => (*day, *month, year.parse::<i64>().ok()?, *clock),
+        _ => return None,
+    };
+    let day: i64 = day.parse().ok()?;
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|m| *m == month_name)?
+        + 1;
+    if !(1601..=9999).contains(&year) {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if day < 1 || day > days[month - 1] {
+        return None;
+    }
+    let time: Vec<u64> = clock.split(':').map(str::parse).collect::<Result<_, _>>().ok()?;
+    if time.len() != 3 || time[0] > 23 || time[1] > 59 || time[2] > 59 {
+        return None;
+    }
+    let before = |y: i64| 365 * y + y / 4 - y / 100 + y / 400;
+    let elapsed_days = before(year - 1) - before(1969) + days[..month - 1].iter().sum::<i64>() + day - 1;
+    if elapsed_days < 0 {
+        return Some(Duration::ZERO);
+    }
+    let seconds = elapsed_days as u64 * 86400 + time[0] * 3600 + time[1] * 60 + time[2];
+    let date = std::time::UNIX_EPOCH.checked_add(Duration::from_secs(seconds))?;
+    Some(date.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
 /// Check cancellation and the shared deadline before starting another blocking operation.
 pub fn remaining(deadline: Instant, cancel: &Cancel) -> Result<Duration, ApiError> {
     if cancel.is_stale() {
@@ -205,6 +286,44 @@ impl Cancel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_accepts_legacy_http_dates() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(784111777);
+        for value in ["Sunday, 06-Nov-94 08:49:57 GMT", "Sun Nov  6 08:49:57 1994"] {
+            assert_eq!(retry_after(value, now), Some(Duration::from_secs(20)), "{value}");
+        }
+        // A two-digit year more than fifty years ahead means the previous century.
+        assert_eq!(retry_after("Sunday, 06-Nov-45 08:49:57 GMT", now), Some(Duration::ZERO));
+        assert_eq!(retry_after("Sun, 06 Nov 1960 08:49:57 GMT", now), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn retry_after_accepts_dates_and_rejects_invalid_values() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(784111777);
+        assert_eq!(retry_after("Sun, 06 Nov 1994 08:49:37 GMT", now), Some(Duration::ZERO));
+        assert_eq!(
+            retry_after("Sun, 06 Nov 1994 08:49:57 GMT", now),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(
+            retry_after("Sun, 06 Nov 1994 08:50:08 GMT", now),
+            Some(Duration::from_secs(31))
+        );
+        assert_eq!(retry_after("20", now), Some(Duration::from_secs(20)));
+        assert_eq!(retry_after("Sun, 31 Feb 1994 08:49:37 GMT", now), None);
+        assert_eq!(retry_after("Sun, 06 Nov 1994 25:49:37 GMT", now), None);
+        assert_eq!(
+            next_step(429, retry_after("Sun, 06 Nov 1994 08:50:08 GMT", now), NEW),
+            Step::Fail(ApiError::RateLimited)
+        );
+        assert_eq!(
+            retry_after("Thu, 29 Feb 2024 00:00:00 GMT", std::time::UNIX_EPOCH),
+            Some(Duration::from_secs(1709164800))
+        );
+        assert_eq!(retry_after("Thu, 29 Feb 2023 00:00:00 GMT", now), None);
+        assert_eq!(retry_after("garbage", now), None);
+    }
 
     const NEW: Seen = Seen {
         has_token: false,
