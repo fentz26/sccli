@@ -559,8 +559,10 @@ impl App {
                     Some("paused-for-cache") => self.pb.set_cache_wait(d.as_bool().unwrap_or(false)),
                     Some("seeking") => self.pb.set_seeking(d.as_bool().unwrap_or(false), now),
                     Some("demuxer-cache-duration") => self.cached_secs = d.as_f64().unwrap_or(0.0),
+                    // mpv clears the position as a stream ends, sometimes before `end-file`.
+                    // Read as 0 it made every finished song look cut off, so it replayed.
                     Some("time-pos") => {
-                        let t = d.as_f64().unwrap_or(0.0);
+                        let Some(t) = d.as_f64() else { return };
                         if self.pb.time_pos(t, now) {
                             if t as u64 != self.time as u64 {
                                 self.dirty = true;
@@ -1304,6 +1306,25 @@ mod tests {
             "restarted from {} after losing it at {lost_at}",
             app.time
         );
+    }
+
+    #[test]
+    #[ignore = "needs mpv installed"]
+    fn a_song_that_plays_to_the_end_moves_on_whatever_order_mpv_reports_it() {
+        let base = serve();
+        let links = [format!("{base}/one"), format!("{base}/two")];
+        let (mut app, rx, _) = app_with(&links);
+        connect(&mut app, &rx);
+        app.go(0);
+        run_until(&mut app, &rx, Duration::from_secs(20), |a| a.time >= 1.0);
+        assert!(app.time >= 1.0, "never started");
+        // As recorded from a SoundCloud stream: the position is cleared before `end-file`.
+        let end = SECONDS as f64 - 0.4;
+        app.mpv_event(&json!({ "event": "property-change", "name": "time-pos", "data": end }));
+        app.mpv_event(&json!({ "event": "property-change", "name": "time-pos" }));
+        app.mpv_event(&json!({ "event": "end-file", "reason": "eof", "playlist_entry_id": 1 }));
+        assert_eq!(app.pb.attempts(), 0, "a finished song was taken for a lost stream");
+        assert_eq!(app.cur, 1, "did not move on to the next song");
     }
 
     #[test]
